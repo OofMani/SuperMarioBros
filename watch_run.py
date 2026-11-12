@@ -1,6 +1,6 @@
 """Watch a trained Mario's run at real NES speed (60 fps), and optionally save it as a video.
 
-    python watch_run.py                              # models/speedrun/fastest.pt, else ppo/solved.pt
+    python watch_run.py                              # newest record: pipe, then speedrun, then ppo/solved.pt
     python watch_run.py --ckpt models/ppo/solved.pt
     python watch_run.py --mp4 runs/speedrun/best_run.mp4          # save a video too
     python watch_run.py --mp4 runs/speedrun/best_run.mp4 --no-window   # just the video
@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from ppo_model import ActorCritic, pick_device
-from wrappers import make_env
+from wrappers import make_env, play_env_kwargs
 
 NES_FPS = 60.0988
 
@@ -37,7 +37,7 @@ def main():
     args = p.parse_args()
 
     ckpt_path = args.ckpt or next(
-        (f for f in ("models/speedrun/fastest.pt", "models/ppo/solved.pt", "models/ppo/best.pt")
+        (f for f in ("models/pipe/fastest.pt", "models/speedrun/fastest.pt", "models/ppo/solved.pt", "models/ppo/best.pt")
          if os.path.exists(f)), None)
     if ckpt_path is None:
         raise SystemExit("No checkpoint found. Pass --ckpt.")
@@ -48,7 +48,7 @@ def main():
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    env = make_env(level=train_args["level"], actions=train_args["actions"], skip=train_args.get("skip", 4))
+    env = make_env(**play_env_kwargs(train_args))
 
     # Grab every NES frame: hook the layer the wrapper steps once per frame
     frames = []

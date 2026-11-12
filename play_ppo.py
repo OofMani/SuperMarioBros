@@ -9,7 +9,7 @@ import os
 import torch
 
 from ppo_model import ActorCritic, pick_device
-from wrappers import make_env
+from wrappers import make_env, play_env_kwargs
 
 
 def main():
@@ -33,8 +33,7 @@ def main():
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    env = make_env(level=train_args["level"], actions=train_args["actions"], render_mode="human",
-                   skip=train_args.get("skip", 4))
+    env = make_env(render_mode="human", **play_env_kwargs(train_args))
     print(f"Playing {ckpt_path}")
     for ep in range(args.episodes):
         obs, _ = env.reset()

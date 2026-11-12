@@ -1,6 +1,6 @@
 """Time how fast a trained Mario finishes the level (speedrun phase 1: baseline).
 
-    python speedrun_eval.py                          # times models/speedrun/fastest.pt (else ppo/solved.pt)
+    python speedrun_eval.py                          # times the newest record (pipe, speedrun, then ppo/solved.pt)
     python speedrun_eval.py --ckpt models/ppo/best.pt
     python speedrun_eval.py --delays 20              # also check 20 random start delays
     python speedrun_eval.py --save runs/speedrun/baseline.json
@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from ppo_model import ActorCritic, pick_device
-from wrappers import make_env
+from wrappers import make_env, play_env_kwargs
 
 NES_FPS = 60.0988
 FRAME_RULE = 21
@@ -61,10 +61,12 @@ def run(model, device, env, delay=0, max_steps=5000):
     return {
         "delay": delay,
         "cleared": bool(info.get("flag_get", False)),
+        "pipe": bool(info.get("pipe", False)),
         "x_pos": int(info.get("x_pos", 0)),
         "frames": int(frames),
         "seconds": round(frames / NES_FPS, 3),
         "timer_used": start_time - int(info.get("time", start_time)),
+        "timer_at_flag": int(info.get("time", 0)),
         "frame_rules": frames // FRAME_RULE,
         "skipped_frames": int(info.get("skipped_frames", 0)),
         "actions": actions,
@@ -75,7 +77,8 @@ def describe(r):
     if not r["cleared"]:
         return f"did not clear (died or stuck at x={r['x_pos']})"
     note = "  (WARNING: went through a skipped animation, time not game-accurate)" if r["skipped_frames"] else ""
-    return (f"{r['frames']} frames = {r['seconds']:.2f} s | in-game timer used {r['timer_used']} | "
+    note = (" via the PIPE" if r["pipe"] else " overland") + note
+    return (f"{r['frames']} frames = {r['seconds']:.2f} s | timer at flag {r['timer_at_flag']} (used {r['timer_used']}) | "
             f"~{r['frame_rules']} frame rules{note}")
 
 
@@ -88,12 +91,13 @@ def main():
     args = p.parse_args()
 
     ckpt_path = args.ckpt or next(
-        (f for f in ("models/speedrun/fastest.pt", "models/ppo/solved.pt", "models/ppo/best.pt") if os.path.exists(f)), None)
+        (f for f in ("models/pipe/fastest.pt", "models/speedrun/fastest.pt", "models/ppo/solved.pt", "models/ppo/best.pt")
+         if os.path.exists(f)), None)
     if ckpt_path is None:
         raise SystemExit("No checkpoint found. Pass --ckpt.")
     device = pick_device(args.device)
     model, train_args = load(ckpt_path, device)
-    env = make_env(level=train_args["level"], actions=train_args["actions"], skip=train_args.get("skip", 4))
+    env = make_env(**play_env_kwargs(train_args))
 
     print(f"checkpoint: {ckpt_path}   level {train_args['level']}")
     main_run = run(model, device, env, delay=0)

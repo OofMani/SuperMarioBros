@@ -5,7 +5,7 @@ An AI that learns to play Super Mario Bros (NES) World 1-1 from the screen pixel
 It started years ago as a DQN agent, inspired by a YouTube video
 [here](https://youtu.be/_gmQZToTMac), that never finished the level. It was rebuilt
 with PPO and parallel training, and it now clears 1-1 every time and speedruns it
-in **1,208 frames (20.10 s)**.
+in **1,172 frames (19.50 s)** overland. It's now learning to find the pipe shortcut.
 
 ## Results so far
 
@@ -16,7 +16,8 @@ in **1,208 frames (20.10 s)**.
 | PPO, first 5/5 perfect evaluation | ~1.66M steps (update 810) |
 | `solved.pt` (3 perfect evaluations in a row) | Clears 1-1 from 20/20 random start delays |
 | Solved run, timed | 1,240 frames = 20.63 s (in-game timer 339 at the flag) |
-| **Speedrun fine-tune, best** | **1,208 frames = 20.10 s** |
+| Speedrun fine-tune, first round | 1,208 frames = 20.10 s |
+| **Speedrun with critic warmup + 5× speed bonus, best** | **1,172 frames = 19.50 s** (stable 1,177 on 100% of tests) |
 
 ## Setup
 
@@ -104,7 +105,11 @@ The A-held fix was the turning point. Within about 20k steps the test distance j
   - **Fix**: `--critic-warmup N` trains only the critic's last layer for N updates while the
     actor stays frozen. It stopped the collapse, with the flag rate staying at 88–97%.
     But the speed still didn't improve past 1,208, and the training median drifted from about
-    1,250 to about 1,270 frames. **The overland route has plateaued for this setup.**
+    1,250 to about 1,270 frames, which looked like a plateau.
+  - **It wasn't a plateau, just a slow start.** The same run kept going, and the median fell to
+    about 1,190. Records came in at 1,197 → 1,177 → **1,172 frames (19.50 s)**, and the frame-0
+    test settled on a stable 1,177 that cleared every evaluation. After that it really did
+    plateau, at about 3 SMB1 frame rules faster than the solved baseline.
 
 ### Lessons
 1. **What the agent can observe and how its actions work matter as much as the algorithm.**
@@ -117,7 +122,47 @@ The A-held fix was the turning point. Within about 20k steps the test distance j
 4. **RL plateaus a few frames short of optimal.** 4-frame steps can't express frame-perfect
    timing, which is where search (TAS-style) or a different route comes in.
 
-## Next: the overhaul branch
+## Pipe route (branch `pipe-route`)
+
+### What the emulator investigation showed
+- The solved Mario **never stands on the enterable pipe** (the 4th one, at x≈912). He jumps
+  clean over it, so he'd never get the chance to press Down.
+- Landing on the pipe top and pressing Down works, but only in a **narrow window**:
+  x=911 worked, while x=923–935 on the same pipe top did nothing.
+- The bonus room needs a precise sequence: jump onto the brick block, drop to the floor
+  (running off the block at full speed lands you *on top of* the exit pipe), then walk
+  into the sideways exit. Mario comes back out at **x=2,616**.
+- gym-super-mario-bros **skips 138 frames** of pipe animations by editing game timers, so
+  pipe times are only honest with those skips turned off (`--accurate-timing`).
+
+| Route (game-accurate timing) | Frames to flag | Timer at flag |
+|---|---|---|
+| Overland, `solved.pt` | 1,240 | 338 |
+| Pipe, clumsy script + solved Mario | 1,098 | 361 |
+| Speedrunners' reference | — | 370 |
+
+### Pipe mode
+```bash
+python make_demo.py overland --ckpt models/ppo/solved.pt   # demos/overland.json (committed)
+python make_demo.py pipe     --ckpt models/ppo/solved.pt   # demos/pipe.json (committed, scripted route)
+python train_ppo.py --pipe-mode --init-from models/ppo/solved.pt
+```
+- **All 12 button combos**, including Down. The 5-button solved model is expanded with
+  action-layer surgery: its rows are copied, and the new buttons start at bias -2, so it
+  plays exactly like `solved.pt` at first.
+- **Game-accurate timing**, so no animation skips.
+- **Reward**: a finish bonus of 1,000, plus 5 per frame under 1,400, -500 for dying or getting
+  stuck, plus 10% of the old x reward as a nudge. The pipe still pays clearly overall.
+- **Reverse curriculum**: half the episodes start from save states along a demo, at first
+  only near the flag. The start moves back by 5% of the demo whenever 70% of those
+  episodes finish.
+- Critic warmup (30 updates) runs automatically when starting from a checkpoint.
+- Training lines show `pipe N%` (the share of finished runs that used the pipe), and
+  evaluations say `via the PIPE` when the record run takes it.
+- `--curriculum demos/pipe.json` is the "assisted" variant. It shows Mario that the
+  route exists without telling him to take it.
+
+## The original plan for the pipe-route branch
 Speedrunners reach about 370 on the in-game timer in 1-1 by taking the enterable pipe to the
 underground bonus room. Our overland run finishes at 339. The next branch will try to let the AI
 find that route:

@@ -38,3 +38,28 @@ class ActorCritic(nn.Module):
         dist = torch.distributions.Categorical(logits=logits)
         action = logits.argmax(-1) if greedy else dist.sample()
         return action, dist.log_prob(action), value
+
+
+def expand_actions(state_dict, old_buttons, new_buttons, new_bias=-3.0):
+    """Action-layer surgery: give a trained model more buttons without losing what it knows.
+
+    The vision layers and the critic are kept as they are. Each old action's row of
+    the actor's output layer is copied to wherever the same button combo sits in the
+    new action list. New combos get small random weights and a negative bias, so at
+    first they're rarely picked (Mario plays as before) but exploration can still find them.
+    """
+    import math
+    old_sets = [frozenset(b) for b in old_buttons]
+    new_sets = [frozenset(b) for b in new_buttons]
+    w_old, b_old = state_dict["actor.weight"], state_dict["actor.bias"]
+    w_new = torch.empty(len(new_sets), w_old.shape[1])
+    nn.init.orthogonal_(w_new, 0.01)
+    b_new = torch.full((len(new_sets),), float(new_bias))
+    for i, s in enumerate(old_sets):
+        if s not in new_sets:
+            raise ValueError(f"old action {sorted(s)} is missing from the new action set")
+        j = new_sets.index(s)
+        w_new[j], b_new[j] = w_old[i], b_old[i]
+    out = dict(state_dict)
+    out["actor.weight"], out["actor.bias"] = w_new, b_new
+    return out

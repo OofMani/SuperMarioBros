@@ -25,6 +25,9 @@ def _worker(remote, env_kwargs):
                     "flag_get": bool(info.get("flag_get", False)),
                     "from_save": bool(info.get("from_save", False)),
                     "frames": int(info.get("frames", 0)),
+                    "from_curriculum": bool(info.get("from_curriculum", False)),
+                    "start_x": int(info.get("start_x", 0)),
+                    "pipe": bool(info.get("pipe", False)),
                 }
                 if done:
                     obs, _ = env.reset()
@@ -32,6 +35,9 @@ def _worker(remote, env_kwargs):
             elif cmd == "reset":
                 obs, _ = env.reset()
                 remote.send(obs)
+            elif cmd == "set":
+                setattr(env, data[0], data[1])  # e.g. move the curriculum start
+                remote.send(None)
             elif cmd == "render":
                 remote.send(env.raw)
             elif cmd == "close":
@@ -70,6 +76,13 @@ class SubprocVecEnv:
     def step(self, actions):
         self.step_async(actions)
         return self.step_wait()
+
+    def set_attr(self, name, value):
+        """Change a wrapper setting in every game (only while no step is in flight)."""
+        for r in self.remotes:
+            r.send(("set", (name, value)))
+        for r in self.remotes:
+            r.recv()
 
     def render_frames(self):
         for r in self.remotes:

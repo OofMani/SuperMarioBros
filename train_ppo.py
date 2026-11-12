@@ -28,6 +28,22 @@ Speedrun mode (fine-tune a solved Mario to finish faster):
     and the gentle fine-tuning settings lr 5e-5 / ent-coef 0.005
   - one evaluation run always starts on frame 0 (a real speedrun start); every
     new record is saved as fastest.pt. It never stops on its own.
+
+Pipe mode (let Mario find the 1-1 pipe shortcut):
+
+    python train_ppo.py --pipe-mode --init-from models/ppo/solved.pt
+    python train_ppo.py --pipe-mode                                   # from scratch (recommended)
+
+  - all buttons (incl. Down); a 5-button checkpoint gets its action layer expanded
+  - game-accurate timing (no skipped pipe animations)
+  - route-neutral reward: finishing (big bonus + speed bonus) and dying count, plus 10% of
+    the old "pixels moved right" reward as a steady nudge (without it, play near the level
+    start drifts and full runs collapse). The pipe skips ~1,700 px (-170) but saves ~140
+    frames (+700 speed bonus), so it still pays clearly.
+  - reverse curriculum: half the episodes start from save states along a demo
+    (demos/overland.json by default), beginning near the flag and moving back
+    as Mario gets reliable; the other half start at the real level start
+  - evaluation prints whether each record run used the pipe
 """
 import argparse
 import os
@@ -44,15 +60,15 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from ppo_model import ActorCritic, pick_device
+from ppo_model import ActorCritic, expand_actions, pick_device
 from vec_env import SubprocVecEnv, tile_frames
-from wrappers import HAS_SNAPSHOTS, make_env
+from wrappers import ACTION_SETS, HAS_SNAPSHOTS, make_env
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--level", default="1-1")
-    p.add_argument("--actions", default="right_only", choices=["right_only", "simple"])
+    p.add_argument("--actions", default="right_only", choices=["right_only", "simple", "complex"])
     p.add_argument("--num-envs", type=int, default=16, help="must be even (two groups)")
     p.add_argument("--num-steps", type=int, default=128, help="steps per env per rollout")
     p.add_argument("--total-steps", type=int, default=10_000_000)
@@ -88,10 +104,45 @@ def parse_args():
                    help="first N updates of this run train only the critic's output layer (actor frozen). "
                         "Use after changing the reward on a trained model.")
     p.add_argument("--warmup-lr", type=float, default=1e-3)
+    # pipe mode
+    p.add_argument("--pipe-mode", action="store_true", help="find the pipe shortcut (see top of file)")
+    p.add_argument("--accurate-timing", action="store_true", help="no skipped pipe/area animations")
+    p.add_argument("--reward", default="x", choices=["x", "finish"], help="x = env reward, finish = route-neutral")
+    p.add_argument("--finish-bonus", type=float, default=1000.0)
+    p.add_argument("--death-penalty", type=float, default=500.0)
+    p.add_argument("--progress-weight", type=float, default=0.0, help="finish reward: weight of the env's x reward")
+    p.add_argument("--curriculum", default=None, help="demo JSON for reverse-curriculum starts")
+    p.add_argument("--curriculum-prob", type=float, default=0.5)
+    p.add_argument("--curriculum-threshold", type=float, default=0.7,
+                   help="move the curriculum start back once this share of curriculum episodes finish")
+    p.add_argument("--curriculum-step", type=float, default=0.05)
+    p.add_argument("--curriculum-window", type=int, default=40, help="curriculum episodes per check")
+    p.add_argument("--new-action-bias", type=float, default=-3.0,
+                   help="starting bias for buttons the --init-from checkpoint didn't have")
     args = p.parse_args()
-    if args.speedrun:
+    given = {a.split("=")[0] for a in sys.argv[1:] if a.startswith("--")}
+    if args.pipe_mode:
+        pipe_defaults = {"--actions": ("actions", "complex"), "--accurate-timing": ("accurate_timing", True),
+                         "--reward": ("reward", "finish"), "--speed-bonus": ("speed_bonus", 5.0),
+                         "--time-cost": ("time_cost", 0.0), "--reward-scale": ("reward_scale", 0.01),
+                         "--curriculum": ("curriculum", "demos/overland.json"),
+                         "--savestate-prob": ("savestate_prob", 0.0), "--gamma": ("gamma", 0.997),
+                         # fine-tuning a checkpoint needs gentle steps; from scratch uses the
+                         # settings that originally solved 1-1 (lower ent-coef later if the
+                         # greedy test gets stuck deciding, as happened at the first pipe)
+                         "--lr": ("lr", 5e-5 if args.init_from else 2.5e-4),
+                         "--ent-coef": ("ent_coef", 0.005 if args.init_from else 0.01),
+                         "--progress-weight": ("progress_weight", 0.1),
+                         "--new-action-bias": ("new_action_bias", -2.0),
+                         "--save-dir": ("save_dir", "models/pipe")}
+        if args.init_from and "--critic-warmup" not in given:
+            args.critic_warmup = 30
+        for flag, (name, value) in pipe_defaults.items():
+            if flag not in given:
+                setattr(args, name, value)
+        args.speedrun = True  # frame-0 evaluation, fastest.pt records, no auto-stop
+    elif args.speedrun:
         # defaults for speedrun mode, used only for flags not given on the command line
-        given = {a.split("=")[0] for a in sys.argv[1:] if a.startswith("--")}
         speedrun_defaults = {"--time-cost": ("time_cost", 0.25), "--speed-bonus": ("speed_bonus", 1.0),
                              "--gamma": ("gamma", 0.997), "--lr": ("lr", 5e-5),
                              "--ent-coef": ("ent_coef", 0.005), "--save-dir": ("save_dir", "models/speedrun")}
@@ -110,7 +161,7 @@ def evaluate(model, device, eval_envs, rng, max_steps=3000, frame0=False):
     The emulator is deterministic, so each run first waits a random 0-30
     steps; a policy that only memorised one exact path fails this.
     With frame0=True, run 0 starts with no wait (the speedrun start).
-    Returns (win rate, mean x, frames of run 0 or None if it didn't finish).
+    Returns (win rate, mean x, frames of run 0 or None if it didn't finish, run 0 used the pipe).
     """
     n = eval_envs.num_envs
     obs = eval_envs.reset()
@@ -120,7 +171,7 @@ def evaluate(model, device, eval_envs, rng, max_steps=3000, frame0=False):
     finished = np.zeros(n, dtype=bool)
     wins = np.zeros(n, dtype=bool)
     xs = np.zeros(n)
-    frames0 = None
+    frames0, pipe0 = None, False
     for t in range(max_steps):
         action, _, _ = model.act(torch.from_numpy(obs).to(device), greedy=True)
         action = action.cpu().numpy()
@@ -131,10 +182,10 @@ def evaluate(model, device, eval_envs, rng, max_steps=3000, frame0=False):
             wins[i] = infos[i]["flag_get"]
             xs[i] = infos[i]["x_pos"]
             if i == 0 and wins[i]:
-                frames0 = infos[i]["frames"]
+                frames0, pipe0 = infos[i]["frames"], infos[i]["pipe"]
         if finished.all():
             break
-    return float(wins.mean()), float(xs.mean()), frames0
+    return float(wins.mean()), float(xs.mean()), frames0, pipe0
 
 
 def main():
@@ -150,12 +201,25 @@ def main():
         print(f"speedrun mode: time_cost={args.time_cost}/frame  speed_bonus={args.speed_bonus}/frame "
               f"under {args.ref_frames}  gamma={args.gamma}  lr={args.lr}  ent_coef={args.ent_coef}  "
               f"skip={args.skip}  save_dir={args.save_dir}")
+    if args.pipe_mode or args.reward == "finish" or args.curriculum:
+        print(f"pipe settings: actions={args.actions}  accurate_timing={args.accurate_timing}  reward={args.reward} "
+              f"(finish {args.finish_bonus}, death -{args.death_penalty}, progress x{args.progress_weight})  "
+              f"reward_scale={args.reward_scale}  curriculum={args.curriculum} (p={args.curriculum_prob})  "
+              f"critic_warmup={args.critic_warmup}")
 
     env_kwargs = dict(level=args.level, actions=args.actions, skip=args.skip,
-                      time_cost=args.time_cost, speed_bonus=args.speed_bonus, ref_frames=args.ref_frames)
+                      time_cost=args.time_cost, speed_bonus=args.speed_bonus, ref_frames=args.ref_frames,
+                      accurate_timing=args.accurate_timing, reward_mode=args.reward,
+                      finish_bonus=args.finish_bonus, death_penalty=args.death_penalty,
+                      progress_weight=args.progress_weight)
+    curriculum_start = 1.0  # fraction of the demo where episodes may start (1 = only the end)
     N, T = args.num_envs, args.num_steps
     half = N // 2
-    groups = [SubprocVecEnv(half, dict(env_kwargs, savestate_prob=args.savestate_prob)) for _ in range(2)]
+    train_kwargs = dict(env_kwargs, savestate_prob=args.savestate_prob)
+    if args.curriculum:
+        train_kwargs.update(curriculum=args.curriculum, curriculum_prob=args.curriculum_prob,
+                            curriculum_start=curriculum_start)
+    groups = [SubprocVecEnv(half, train_kwargs) for _ in range(2)]
     slices = [slice(0, half), slice(half, N)]
     eval_envs = SubprocVecEnv(args.eval_episodes, env_kwargs)  # always from the real start
 
@@ -175,7 +239,13 @@ def main():
     latest = os.path.join(args.save_dir, "latest.pt")
     if args.init_from and not (args.resume and os.path.exists(latest)):
         init = torch.load(args.init_from, map_location=device, weights_only=False)  # our own file
-        model.load_state_dict(init["model"])
+        weights = init["model"]
+        if init["n_actions"] != n_actions:
+            old_buttons = ACTION_SETS[init["args"]["actions"]]
+            weights = expand_actions(weights, old_buttons, ACTION_SETS[args.actions], args.new_action_bias)
+            print(f"expanded the action layer from {init['n_actions']} to {n_actions} buttons "
+                  f"(new ones start at bias {args.new_action_bias})")
+        model.load_state_dict(weights)
         print(f"starting from the weights in {args.init_from}")
     if args.resume and os.path.exists(latest):
         ckpt = torch.load(latest, map_location=device, weights_only=False)  # our own file
@@ -184,9 +254,13 @@ def main():
         global_step, update = ckpt["global_step"], ckpt["update"]
         streak, best_eval = ckpt.get("streak", 0), ckpt.get("best_eval", -1.0)
         best_frames = ckpt.get("best_frames")
+        curriculum_start = ckpt.get("curriculum_start", curriculum_start)
+        if args.curriculum:
+            for g in groups:
+                g.set_attr("curriculum_start", curriculum_start)
         print(f"resumed from step {global_step}")
 
-    run_kind = "speedrun" if args.speedrun else "ppo"
+    run_kind = "pipe" if args.pipe_mode else ("speedrun" if args.speedrun else "ppo")
     writer = SummaryWriter(f"runs/{run_kind}_{args.level}_{time.strftime('%Y%m%d-%H%M%S')}")
     rng = np.random.default_rng()
 
@@ -207,6 +281,8 @@ def main():
     ep_return = np.zeros(N)
     recent_returns, recent_x, recent_flags = deque(maxlen=100), deque(maxlen=100), deque(maxlen=100)
     recent_frames = deque(maxlen=100)  # frames to the flag, full runs that finished
+    recent_pipe = deque(maxlen=100)    # full runs that finished through the pipe
+    curriculum_results = []            # finished? for episodes that started on the curriculum
     watching = args.watch
     frames_cache, infos_cache = [None, None], [[{"x_pos": 0}] * half, [{"x_pos": 0}] * half]
     t_start, steps_at_start = time.time(), global_step
@@ -229,8 +305,13 @@ def main():
                 recent_flags.append(float(infos[i]["flag_get"]))
                 if infos[i]["flag_get"]:
                     recent_frames.append(infos[i]["frames"])
+                    recent_pipe.append(float(infos[i]["pipe"]))
                 writer.add_scalar("episode/return", ep_return[j], global_step)
                 writer.add_scalar("episode/x_pos", infos[i]["x_pos"], global_step)
+            if infos[i]["from_curriculum"]:
+                curriculum_results.append(float(infos[i]["flag_get"]))
+                if infos[i]["pipe"]:
+                    writer.add_scalar("curriculum/pipe_start_x", infos[i]["start_x"], global_step)
             ep_return[j] = 0
         infos_cache[g] = infos
         if watching and t % args.render_every == 0:
@@ -335,27 +416,46 @@ def main():
                 f"return {np.mean(recent_returns):7.1f} | x {np.mean(recent_x):6.0f} | "
                 f"flag {100 * np.mean(recent_flags):5.1f}%"
                 + (f" | frames {int(np.median(recent_frames))}" if args.speedrun and recent_frames else "")
+                + (f" | pipe {100 * np.mean(recent_pipe):.0f}%" if args.pipe_mode and recent_pipe else "")
+                + (f" | start {curriculum_start:.2f}" if args.curriculum else "")
                 + (f" | critic warmup, value loss {v_loss.item():.3f}" if warming_up else "")
             )
+            if recent_pipe:
+                writer.add_scalar("train/pipe_rate_of_finishes", np.mean(recent_pipe), global_step)
             if recent_frames:
                 writer.add_scalar("train/frames_to_flag_median", float(np.median(recent_frames)), global_step)
+
+        # ---- Reverse curriculum: once Mario finishes reliably from here, start him earlier ----
+        if args.curriculum and len(curriculum_results) >= args.curriculum_window:
+            rate = float(np.mean(curriculum_results))
+            curriculum_results.clear()
+            writer.add_scalar("curriculum/finish_rate", rate, global_step)
+            if rate >= args.curriculum_threshold and curriculum_start > 0:
+                curriculum_start = max(0.0, curriculum_start - args.curriculum_step)
+                for g in groups:
+                    g.set_attr("curriculum_start", curriculum_start)  # groups are idle between rollouts
+                print(f"  curriculum: {100 * rate:.0f}% of curriculum starts finished, "
+                      f"now starting from the last {100 * (1 - curriculum_start):.0f}% of the demo")
+            writer.add_scalar("curriculum/start", curriculum_start, global_step)
 
         # ---- Greedy evaluation: is it actually beating the level? ----
         if update % args.eval_every == 0:
             model.eval()
-            win_rate, mean_x, frames0 = evaluate(model, device, eval_envs, rng, frame0=args.speedrun)
+            win_rate, mean_x, frames0, pipe0 = evaluate(model, device, eval_envs, rng, frame0=args.speedrun)
             writer.add_scalar("eval/win_rate", win_rate, global_step)
             writer.add_scalar("eval/x_pos", mean_x, global_step)
             print(f"  eval: cleared {100 * win_rate:.0f}% of {args.eval_episodes} runs, mean x {mean_x:.0f}"
-                  + (f" | frame-0 run: {frames0 if frames0 else 'did not finish'} frames" if args.speedrun else ""))
+                  + (f" | frame-0 run: {frames0 if frames0 else 'did not finish'} frames" if args.speedrun else "")
+                  + (" via the PIPE" if pipe0 else ""))
             if args.speedrun and frames0:
                 writer.add_scalar("eval/frames_to_flag", frames0, global_step)
                 if best_frames is None or frames0 < best_frames:
                     best_frames = frames0
                     torch.save({"model": model.state_dict(), "n_actions": n_actions, "obs_shape": obs_shape,
-                                "args": vars(args), "frames": frames0},
+                                "args": vars(args), "frames": frames0, "pipe": pipe0},
                                os.path.join(args.save_dir, "fastest.pt"))
-                    print(f"  new record: {frames0} frames ({frames0 / 60.0988:.2f} s), saved fastest.pt")
+                    print(f"  new record: {frames0} frames ({frames0 / 60.0988:.2f} s)"
+                          f"{' through the pipe' if pipe0 else ''}, saved fastest.pt")
             score = float(win_rate * 10_000 + mean_x)
             if score > best_eval:
                 best_eval = score
@@ -367,7 +467,8 @@ def main():
         torch.save(
             {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
              "global_step": global_step, "update": update, "streak": streak,
-             "best_eval": best_eval, "best_frames": best_frames, "args": vars(args),
+             "best_eval": best_eval, "best_frames": best_frames, "curriculum_start": curriculum_start,
+             "args": vars(args),
              "n_actions": n_actions, "obs_shape": obs_shape},
             latest,
         )
