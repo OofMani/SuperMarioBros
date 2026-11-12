@@ -1,189 +1,89 @@
-import torch
+"""Train the (fixed-up) DQN agent on one Mario level.
 
-import matplotlib.pyplot as plt
-import random
+    python main.py                 # train, no window (much faster)
+    python main.py --display       # watch while it trains
+    python main.py --resume        # continue from models/dqn/model.pt
+    tensorboard --logdir runs      # graphs
 
-import gym_super_mario_bros
-from gym_super_mario_bros.actions import RIGHT_ONLY
+For the faster, parallel trainer see train_ppo.py.
+"""
+import argparse
+import os
+import time
+
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
 from agent import Agent
+from wrappers import make_env
 
-from nes_py.wrappers import JoypadSpace
-from wrappers import apply_wrappers
+p = argparse.ArgumentParser()
+p.add_argument("--level", default="1-1")
+p.add_argument("--episodes", type=int, default=20_000)
+p.add_argument("--display", action="store_true")
+p.add_argument("--resume", action="store_true")
+p.add_argument("--save-every", type=int, default=100)
+p.add_argument("--eval-every", type=int, default=50)
+p.add_argument("--save-dir", default="models/dqn")
+args = p.parse_args()
 
-import os
+os.makedirs(args.save_dir, exist_ok=True)
+model_path = os.path.join(args.save_dir, "model.pt")
 
-from utils import *
-
-model_path = os.path.join("models/first_run/model.pt")
-os.makedirs(os.path.join("models/first_run"), exist_ok=True)
-
-if torch.cuda.is_available():
-    print("Using CUDA device:", torch.cuda.get_device_name(0))
-else:
-    print("CUDA is not available")
-
-ENV_NAME = 'SuperMarioBros-1-1-v0'
-SHOULD_TRAIN = True
-DISPLAY = True
-CKPT_SAVE_INTERVAL = 100
-NUM_OF_EPISODES = 10000
-
-env = gym_super_mario_bros.make(ENV_NAME, render_mode='human' if DISPLAY else 'rgb', apply_api_compatibility=True)
-env = JoypadSpace(env, RIGHT_ONLY)
-
-env = apply_wrappers(env)
-
+env = make_env(level=args.level, render_mode="human" if args.display else "rgb_array")
+eval_env = make_env(level=args.level)
 agent = Agent(input_dims=env.observation_space.shape, num_actions=env.action_space.n)
-agent.load_model(model_path)
+print("device:", agent.device)
+if args.resume and os.path.exists(model_path):
+    agent.load_model(model_path)
+    agent.epsilon = agent.eps_start = 0.1  # it already knows something; explore less
+    print("resumed from", model_path)
 
-if not SHOULD_TRAIN:
-    folder_name = ""
-    ckpt_name = ""
-    agent.load_model(os.path.join("models", folder_name, ckpt_name))
-    agent.epsilon = 0.2
-    agent.eps_min = 0.0
-    agent.eps_decay = 0.0
-
-env.reset()
-next_state, reward, done, trunc, info = env.step(action=0)
+writer = SummaryWriter(f"runs/dqn_{args.level}_{time.strftime('%Y%m%d-%H%M%S')}")
 
 
-plt.ion() # turning interactive mode on
-
-x=[0]
-y=[0]
-tensum=0
-hunsum=0
-
-ten_avg=[0]
-curr_ten_avg=0
-hun_avg=[0]
-curr_hun_avg=0
-
-# plotting the first frame
-graph = plt.plot(x,y)[0]
-graph2 = plt.plot(x,ten_avg)[0]
-graph3 = plt.plot(x,hun_avg)[0]
-
-plt.pause(1)
-
-curr=0
+def evaluate():
+    """One run with no randomness. The emulator is deterministic, so if this
+    reaches the flag, the same policy will reach it every time."""
+    state, _ = eval_env.reset()
+    done, info = False, {}
+    while not done:
+        state, _, term, trunc, info = eval_env.step(agent.choose_action(state, greedy=True))
+        done = term or trunc
+    return info.get("flag_get", False), info.get("x_pos", 0)
 
 
-for i in range(NUM_OF_EPISODES):   
-
-
-    print("Episode: ", i+1)
-    done = False
+for ep in range(1, args.episodes + 1):
     state, _ = env.reset()
-    total_reward = 0
+    done, total_reward, info = False, 0.0, {}
     while not done:
         a = agent.choose_action(state)
-        new_state, reward, done, truncated, info  = env.step(a)
+        new_state, reward, term, trunc, info = env.step(a)
+        done = term or trunc
+        # Only a real ending (death/flag) cuts off the future; a stuck-timeout doesn't
+        agent.store_in_memory(state, a, reward, new_state, term)
+        agent.learn()
+        state = new_state
         total_reward += reward
 
-        if SHOULD_TRAIN:
-            agent.store_in_memory(state, a, reward, new_state, done)
-            agent.learn()
+    writer.add_scalar("episode/return", total_reward, agent.step_counter)
+    writer.add_scalar("episode/x_pos", info.get("x_pos", 0), agent.step_counter)
+    writer.add_scalar("episode/epsilon", agent.epsilon, agent.step_counter)
+    print(f"ep {ep:6d} | return {total_reward:7.1f} | x {info.get('x_pos', 0):5d} | "
+          f"eps {agent.epsilon:.3f} | steps {agent.step_counter}")
 
-        state = new_state
-
-    print("Total reward: ", total_reward, " Epsilon: ", agent.epsilon, " Size of replay buffer: ", len(agent.replay_buffer), " Learn step counter: ", agent.learn_step_counter)
-
-    # preparing the data
-    y.append(total_reward)
-    x.append(i)
-
-
-    tensum+=total_reward
-    hunsum+=total_reward
-
-    # removing the older graph
-    graph.remove()
-
-    if SHOULD_TRAIN and (i + 1) % CKPT_SAVE_INTERVAL == 0:
-        print("\n")
-        print("-"*35)
-        print("Saving Weights...")
-        print("-"*35)
-
+    if ep % args.save_every == 0:
         agent.save_model(model_path)
-    else:
-        print("Not Saving...\n")
-        
-    print("Total reward: ", total_reward)
 
-
-
-    if((i+1)%100==0):
-        
-        curr_hun_avg=hunsum/100
-        print("/n -----------------ADDING HUNSUM = ", curr_hun_avg, "-------------------------/n")
-        for i in range(100):
-            hun_avg.append(curr_hun_avg)
-
-        graph3.remove()
-        graph3 = plt.plot(x,hun_avg,color = 'r')[0]
-        hunsum=0
-
-        curr_ten_avg=tensum/10
-        print("/n -----------------ADDING TENSUM = ", curr_ten_avg, "-------------------------/n")
-        for i in range(10):
-            ten_avg.append(curr_ten_avg)
-        
-        graph2.remove()
-        graph2 = plt.plot(x,ten_avg,color = 'b')[0]
-        tensum=0
-        plt.pause(1)
-
-    elif((i+1)%10==0):
-
-
-        curr_ten_avg=tensum/10
-        print("/n -----------------ADDING TENSUM = ", curr_ten_avg, "-------------------------/n")
-        for i in range(10):
-            ten_avg.append(curr_ten_avg)
-        
-        graph2.remove()
-        graph2 = plt.plot(x,ten_avg,color = 'b')[0]
-        tensum=0
-        plt.pause(1)
-    
-
-    #else:
-    #ten_avg.append(curr_ten_avg)
-
-    
-    #else:
-    #hun_avg.append(curr_hun_avg)
-
-	
-	# plotting newer graph
-    graph = plt.plot(x,y,color = 'g')[0]
-    plt.xlim(max(x[-1]-150,x[0]), x[-1])
-    curr = max(curr, y[-1])
-    plt.ylim(0,curr+10)
-
-    
+    if ep % args.eval_every == 0:
+        flag, x = evaluate()
+        writer.add_scalar("eval/x_pos", x, agent.step_counter)
+        print(f"  greedy eval: x={x} flag={'YES' if flag else 'no'}")
+        if flag:
+            agent.save_model(os.path.join(args.save_dir, "solved.pt"))
+            print("  Cleared the level with no randomness! Saved solved.pt")
+            break
 
 env.close()
-
-
-
-
-
-
-#------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-	
+eval_env.close()
+writer.close()

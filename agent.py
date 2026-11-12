@@ -1,115 +1,130 @@
-import torch
 import numpy as np
-from agent_nn import AgentNN
+import torch
 
-from tensordict import TensorDict
-from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
+from agent_nn import AgentNN, pick_device
+
+
+class ReplayBuffer:
+    """Stores transitions as uint8 in plain numpy arrays.
+
+    The next state is the current stack shifted by one frame, so only the one
+    new frame is stored instead of a whole second stack. 100k transitions take
+    about 3.5 GB of RAM (the old float32 version needed about 22 GB).
+    """
+
+    def __init__(self, capacity, obs_shape):
+        self.capacity = capacity
+        self.states = np.zeros((capacity, *obs_shape), dtype=np.uint8)
+        self.next_frames = np.zeros((capacity, *obs_shape[1:]), dtype=np.uint8)
+        self.actions = np.zeros(capacity, dtype=np.int64)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.float32)
+        self.idx = 0
+        self.size = 0
+
+    def __len__(self):
+        return self.size
+
+    def add(self, state, action, reward, next_state, done):
+        i = self.idx
+        self.states[i] = state
+        self.next_frames[i] = next_state[-1]
+        self.actions[i] = action
+        self.rewards[i] = reward
+        self.dones[i] = done
+        self.idx = (i + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size, device):
+        ids = np.random.randint(0, self.size, size=batch_size)
+        states = self.states[ids]
+        next_states = np.concatenate([states[:, 1:], self.next_frames[ids][:, None]], axis=1)
+        to = lambda a: torch.from_numpy(a).to(device)
+        return to(states), to(self.actions[ids]), to(self.rewards[ids]), to(next_states), to(self.dones[ids])
+
 
 class Agent:
-    def __init__(self, 
-                 input_dims, 
-                 num_actions, 
-                 lr=0.00025, 
-                 gamma=0.9, 
-                 epsilon=0.25, 
-                 eps_decay=0.9999975, 
-                 eps_min=0.1, 
-                 replay_buffer_capacity=100_000, 
-                 batch_size=32, 
-                 sync_network_rate=10000):
-        
+    def __init__(self,
+                 input_dims,
+                 num_actions,
+                 lr=1e-4,
+                 gamma=0.99,            # was 0.9: now it plans ~100 steps ahead, not ~10
+                 eps_start=1.0,
+                 eps_min=0.05,          # was 0.1, and evaluation now uses 0
+                 eps_decay_steps=1_000_000,
+                 replay_buffer_capacity=100_000,
+                 batch_size=32,
+                 learn_every=4,
+                 learn_starts=10_000,
+                 sync_network_rate=10_000,
+                 device="auto"):
+
         self.num_actions = num_actions
+        self.gamma = gamma
+        self.epsilon = eps_start
+        self.eps_start = eps_start
+        self.eps_min = eps_min
+        self.eps_decay_steps = eps_decay_steps
+        self.batch_size = batch_size
+        self.learn_every = learn_every
+        self.learn_starts = learn_starts
+        self.sync_network_rate = sync_network_rate
+        self.step_counter = 0
         self.learn_step_counter = 0
 
-        # Hyperparameters
-        self.lr = lr
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.eps_decay = eps_decay
-        self.eps_min = eps_min
-        self.batch_size = batch_size
-        self.sync_network_rate = sync_network_rate
+        self.device = pick_device(device)
+        self.online_network = AgentNN(input_dims, num_actions).to(self.device)
+        self.target_network = AgentNN(input_dims, num_actions, freeze=True).to(self.device)
+        self.target_network.load_state_dict(self.online_network.state_dict())
 
-        # Networks
-        self.online_network = AgentNN(input_dims, num_actions)
-        self.target_network = AgentNN(input_dims, num_actions, freeze=True)
+        self.optimizer = torch.optim.Adam(self.online_network.parameters(), lr=lr)
+        self.loss = torch.nn.SmoothL1Loss()  # Huber loss: big mistakes don't blow up training
+        self.replay_buffer = ReplayBuffer(replay_buffer_capacity, input_dims)
 
-        # Optimizer and loss
-        self.optimizer = torch.optim.Adam(self.online_network.parameters(), lr=self.lr)
-        self.loss = torch.nn.MSELoss()
-        # self.loss = torch.nn.SmoothL1Loss() # Feel free to try this loss function instead!
-
-        # Replay buffer
-        storage = LazyMemmapStorage(replay_buffer_capacity)
-        self.replay_buffer = TensorDictReplayBuffer(storage=storage)
-
-    def choose_action(self, observation):
-        if np.random.random() < self.epsilon:
+    def choose_action(self, observation, greedy=False):
+        if not greedy and np.random.random() < self.epsilon:
             return np.random.randint(self.num_actions)
-        # Passing in a list of numpy arrays is slower than creating a tensor from a numpy array
-        # Hence the `np.array(observation)` instead of `observation`
-        # observation is a LIST of numpy arrays because of the LazyFrame wrapper
-        # Unqueeze adds a dimension to the tensor, which represents the batch dimension
-        observation = torch.tensor(np.array(observation), dtype=torch.float32) \
-                        .unsqueeze(0) \
-                        .to(self.online_network.device)
-        # Grabbing the index of the action that's associated with the highest Q-value
-        return self.online_network(observation).argmax().item()
-    
+        obs = torch.from_numpy(np.asarray(observation)).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            return self.online_network(obs).argmax().item()
+
     def decay_epsilon(self):
-        self.epsilon = max(self.epsilon * self.eps_decay, self.eps_min)
+        frac = min(1.0, self.step_counter / self.eps_decay_steps)
+        self.epsilon = self.eps_start + frac * (self.eps_min - self.eps_start)
 
     def store_in_memory(self, state, action, reward, next_state, done):
-        self.replay_buffer.add(TensorDict({
-                                            "state": torch.tensor(np.array(state), dtype=torch.float32), 
-                                            "action": torch.tensor(action),
-                                            "reward": torch.tensor(reward), 
-                                            "next_state": torch.tensor(np.array(next_state), dtype=torch.float32), 
-                                            "done": torch.tensor(done)
-                                          }, batch_size=[]))
-        
-    def sync_networks(self):
-        if self.learn_step_counter % self.sync_network_rate == 0 and self.learn_step_counter > 0:
-            self.target_network.load_state_dict(self.online_network.state_dict())
+        self.replay_buffer.add(np.asarray(state), action, reward, np.asarray(next_state), done)
 
     def save_model(self, path):
         torch.save(self.online_network.state_dict(), path)
 
     def load_model(self, path):
-        self.online_network.load_state_dict(torch.load(path))
-        self.target_network.load_state_dict(torch.load(path))
+        state = torch.load(path, map_location=self.device)
+        self.online_network.load_state_dict(state)
+        self.target_network.load_state_dict(state)
 
     def learn(self):
-        if len(self.replay_buffer) < self.batch_size:
+        """Call once per environment step; it only trains every `learn_every` steps."""
+        self.step_counter += 1
+        self.decay_epsilon()
+        if len(self.replay_buffer) < self.learn_starts or self.step_counter % self.learn_every:
             return
-        
-        self.sync_networks()
-        
+
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size, self.device)
+
+        q = self.online_network(states).gather(1, actions[:, None]).squeeze(1)
+        with torch.no_grad():
+            # Double DQN: the online net picks the next action, the target net scores it
+            next_actions = self.online_network(next_states).argmax(1, keepdim=True)
+            next_q = self.target_network(next_states).gather(1, next_actions).squeeze(1)
+            target = rewards + self.gamma * next_q * (1 - dones)
+
+        loss = self.loss(q, target)
         self.optimizer.zero_grad()
-
-        samples = self.replay_buffer.sample(self.batch_size).to(self.online_network.device)
-
-        keys = ("state", "action", "reward", "next_state", "done")
-
-        states, actions, rewards, next_states, dones = [samples[key] for key in keys]
-
-        predicted_q_values = self.online_network(states) # Shape is (batch_size, n_actions)
-        predicted_q_values = predicted_q_values[np.arange(self.batch_size), actions.squeeze()]
-
-        # Max returns two tensors, the first one is the maximum value, the second one is the index of the maximum value
-        target_q_values = self.target_network(next_states).max(dim=1)[0]
-        # The rewards of any future states don't matter if the current state is a terminal state
-        # If done is true, then 1 - done is 0, so the part after the plus sign (representing the future rewards) is 0
-        target_q_values = rewards + self.gamma * target_q_values * (1 - dones.float())
-
-        loss = self.loss(predicted_q_values, target_q_values)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.online_network.parameters(), 10.0)
         self.optimizer.step()
 
         self.learn_step_counter += 1
-        self.decay_epsilon()
-
-
-        
-
-
+        if self.learn_step_counter % self.sync_network_rate == 0:
+            self.target_network.load_state_dict(self.online_network.state_dict())

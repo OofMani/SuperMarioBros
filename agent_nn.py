@@ -1,11 +1,22 @@
+import numpy as np
 import torch
 from torch import nn
-import numpy as np
+
+
+def pick_device(name="auto"):
+    if name != "auto":
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():  # Apple Silicon GPU
+        return torch.device("mps")
+    return torch.device("cpu")
+
 
 class AgentNN(nn.Module):
     def __init__(self, input_shape, n_actions, freeze=False):
         super().__init__()
-        # Conolutional layers
+        # Convolutional layers
         self.conv_layers = nn.Sequential(
             nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
             nn.ReLU(),
@@ -28,19 +39,15 @@ class AgentNN(nn.Module):
 
         if freeze:
             self._freeze()
-        
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.to(self.device)
 
     def forward(self, x):
-        return self.network(x)
+        # Frames arrive as uint8 (0-255); scale to 0-1 here so the buffer can stay small
+        return self.network(x.float() / 255.0)
 
     def _get_conv_out(self, shape):
         o = self.conv_layers(torch.zeros(1, *shape))
-        # np.prod returns the product of array elements over a given axis
         return int(np.prod(o.size()))
-    
-    def _freeze(self):        
+
+    def _freeze(self):
         for p in self.network.parameters():
             p.requires_grad = False
-    

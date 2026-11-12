@@ -1,0 +1,53 @@
+--- a/nes_py/nes/include/emulator.hpp	2021-07-29 02:05:43
++++ b/nes_py/nes/include/emulator.hpp	2026-11-11 17:37:11
+@@ -101,6 +101,26 @@
+         cpu = backup_cpu;
+         ppu = backup_ppu;
+     }
++
++    /// A full machine state, so many save states can exist at once
++    /// (added for SuperMarioBros RL: start episodes from mid-level saves)
++    struct State {
++        MainBus bus;
++        PictureBus picture_bus;
++        CPU cpu;
++        PPU ppu;
++    };
++
++    /// Return a new heap-allocated copy of the current state.
++    inline State* snapshot() { return new State{bus, picture_bus, cpu, ppu}; }
++
++    /// Load a state created by snapshot().
++    inline void load(const State* s) {
++        bus = s->bus;
++        picture_bus = s->picture_bus;
++        cpu = s->cpu;
++        ppu = s->ppu;
++    }
+ };
+ 
+ }  // namespace NES
+--- a/nes_py/nes/src/lib_nes_env.cpp	2021-07-29 02:05:43
++++ b/nes_py/nes/src/lib_nes_env.cpp	2026-11-11 17:37:11
+@@ -77,6 +77,21 @@
+         emu->restore();
+     }
+ 
++    /// Create a new save state and return a handle to it
++    EXP void* Snapshot(NES::Emulator* emu) {
++        return emu->snapshot();
++    }
++
++    /// Load a save state created by Snapshot
++    EXP void LoadSnapshot(NES::Emulator* emu, void* state) {
++        emu->load(static_cast<NES::Emulator::State*>(state));
++    }
++
++    /// Free a save state created by Snapshot
++    EXP void FreeSnapshot(void* state) {
++        delete static_cast<NES::Emulator::State*>(state);
++    }
++
+     /// Close the emulator, i.e., purge it from memory
+     EXP void Close(NES::Emulator* emu) {
+         delete emu;

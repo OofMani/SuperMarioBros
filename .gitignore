@@ -1,0 +1,6 @@
+__pycache__/
+runs/
+models/ppo/
+models/dqn/
+games/
+.DS_Store
