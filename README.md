@@ -153,8 +153,16 @@ python train_ppo.py --pipe-mode --init-from models/ppo/solved.pt
   action-layer surgery: its rows are copied, and the new buttons start at bias -2, so it
   plays exactly like `solved.pt` at first.
 - **Game-accurate timing**, so no animation skips.
-- **Reward**: a finish bonus of 1,000, plus 5 per frame under 1,400, -500 for dying or getting
-  stuck, plus 10% of the old x reward as a nudge. The pipe still pays clearly overall.
+- **Reward**: a finish bonus of 1,000, plus 5 per frame under 3,000, -500 for dying or getting
+  stuck (after 50 steps without progress), -0.05 per frame, plus 20% of the old x reward as a
+  nudge. The pipe still pays clearly overall.
+  - **First attempt:** with a 150-step stuck timer and no per-frame cost, the greedy Mario
+    learned to **stand still**. Waiting put off the -500, and the discount made a later penalty
+    look smaller. The short timer and the per-frame cost removed that incentive.
+  - **Surprise:** because of auto-release, **holding right+A (endless bunny-hopping) clears 1-1**
+    in about 1,950 frames. A fresh network finds this within about 10 updates, so finishing is
+    easy here. The speed bonus is measured from 3,000 frames so it rewards every frame saved
+    from that point on.
 - **Reverse curriculum**: half the episodes start from save states along a demo, at first
   only near the flag. The start moves back by 5% of the demo whenever 70% of those
   episodes finish.

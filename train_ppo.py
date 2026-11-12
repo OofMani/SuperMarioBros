@@ -36,10 +36,11 @@ Pipe mode (let Mario find the 1-1 pipe shortcut):
 
   - all buttons (incl. Down); a 5-button checkpoint gets its action layer expanded
   - game-accurate timing (no skipped pipe animations)
-  - route-neutral reward: finishing (big bonus + speed bonus) and dying count, plus 10% of
-    the old "pixels moved right" reward as a steady nudge (without it, play near the level
-    start drifts and full runs collapse). The pipe skips ~1,700 px (-170) but saves ~140
-    frames (+700 speed bonus), so it still pays clearly.
+  - route-neutral reward: finishing (big bonus + speed bonus) and dying count, plus 20% of
+    the old "pixels moved right" reward as a steady nudge, a small cost per frame (0.05) and
+    a 50-step stuck timer. Without those, he learned to stand still to put off the death
+    penalty. The pipe skips ~1,700 px (-340) but saves ~140 frames (+700 speed bonus),
+    so it still pays clearly.
   - reverse curriculum: half the episodes start from save states along a demo
     (demos/overland.json by default), beginning near the flag and moving back
     as Mario gets reliable; the other half start at the real level start
@@ -106,6 +107,8 @@ def parse_args():
     p.add_argument("--speed-bonus", type=float, default=None,
                    help="flag bonus per frame finished under --ref-frames (speedrun: 1.0)")
     p.add_argument("--ref-frames", type=int, default=1400)
+    p.add_argument("--stuck-steps", type=int, default=150,
+                   help="end an episode after this many steps without new progress (pipe mode: 50)")
     p.add_argument("--critic-warmup", type=int, default=0,
                    help="first N updates of this run train only the critic's output layer (actor frozen). "
                         "Use after changing the reward on a trained model.")
@@ -130,7 +133,14 @@ def parse_args():
     if args.pipe_mode:
         pipe_defaults = {"--actions": ("actions", "complex"), "--accurate-timing": ("accurate_timing", True),
                          "--reward": ("reward", "finish"), "--speed-bonus": ("speed_bonus", 5.0),
-                         "--time-cost": ("time_cost", 0.0), "--reward-scale": ("reward_scale", 0.01),
+                         # a small cost per frame and a short stuck timer, so standing still to put
+                         # off the death penalty doesn't pay (he learned to procrastinate without them)
+                         "--time-cost": ("time_cost", 0.05), "--stuck-steps": ("stuck_steps", 50),
+                         # holding right+A (endless bunny-hop, thanks to auto-release) clears 1-1 in
+                         # ~1,950 frames and a fresh network finds it within ~10 updates, so the speed
+                         # bonus has to pay for every frame below that, not only below 1,400
+                         "--ref-frames": ("ref_frames", 3000),
+                         "--reward-scale": ("reward_scale", 0.01),
                          "--curriculum": ("curriculum", "demos/overland.json"),
                          "--savestate-prob": ("savestate_prob", 0.0), "--gamma": ("gamma", 0.997),
                          # fine-tuning a checkpoint needs gentle steps; from scratch uses the
@@ -138,7 +148,7 @@ def parse_args():
                          # greedy test gets stuck deciding, as happened at the first pipe)
                          "--lr": ("lr", 5e-5 if args.init_from else 2.5e-4),
                          "--ent-coef": ("ent_coef", 0.005 if args.init_from else 0.01),
-                         "--progress-weight": ("progress_weight", 0.1),
+                         "--progress-weight": ("progress_weight", 0.2),
                          "--new-action-bias": ("new_action_bias", -2.0),
                          "--save-dir": ("save_dir", "models/pipe")}
         if args.init_from and "--critic-warmup" not in given:
@@ -217,7 +227,7 @@ def main():
                       time_cost=args.time_cost, speed_bonus=args.speed_bonus, ref_frames=args.ref_frames,
                       accurate_timing=args.accurate_timing, reward_mode=args.reward,
                       finish_bonus=args.finish_bonus, death_penalty=args.death_penalty,
-                      progress_weight=args.progress_weight)
+                      progress_weight=args.progress_weight, stuck_steps=args.stuck_steps)
     curriculum_start = 1.0  # fraction of the demo where episodes may start (1 = only the end)
     N, T = args.num_envs, args.num_steps
     half = N // 2
@@ -301,8 +311,7 @@ def main():
     next_done = [torch.zeros(half, device=device) for _ in groups]
     ep_return = np.zeros(N)
     recent_returns, recent_x, recent_flags = deque(maxlen=100), deque(maxlen=100), deque(maxlen=100)
-    recent_frames = deque(maxlen=100)  # frames to the flag, full runs that finished
-    recent_pipe = deque(maxlen=100)    # full runs that finished through the pipe
+    recent_finishes = deque(maxlen=100)  # per full run: (frames, used the pipe) if it finished, else None
     curriculum_results = []            # finished? for episodes that started on the curriculum
     watching = args.watch
     frames_cache, infos_cache = [None, None], [[{"x_pos": 0}] * half, [{"x_pos": 0}] * half]
@@ -324,9 +333,8 @@ def main():
                 recent_returns.append(ep_return[j])
                 recent_x.append(infos[i]["x_pos"])
                 recent_flags.append(float(infos[i]["flag_get"]))
-                if infos[i]["flag_get"]:
-                    recent_frames.append(infos[i]["frames"])
-                    recent_pipe.append(float(infos[i]["pipe"]))
+                recent_finishes.append((infos[i]["frames"], float(infos[i]["pipe"]))
+                                       if infos[i]["flag_get"] else None)
                 writer.add_scalar("episode/return", ep_return[j], global_step)
                 writer.add_scalar("episode/x_pos", infos[i]["x_pos"], global_step)
             if infos[i]["from_curriculum"]:
@@ -430,6 +438,9 @@ def main():
         writer.add_scalar("loss/value", v_loss.item(), global_step)
         writer.add_scalar("loss/entropy", entropy.item(), global_step)
         writer.add_scalar("perf/steps_per_sec", sps, global_step)
+        finishes = [r for r in recent_finishes if r is not None]
+        recent_frames = [r[0] for r in finishes]
+        recent_pipe = [r[1] for r in finishes]
         if recent_returns:
             writer.add_scalar("train/flag_rate_100", np.mean(recent_flags), global_step)
             print(
@@ -437,7 +448,7 @@ def main():
                 f"return {np.mean(recent_returns):7.1f} | x {np.mean(recent_x):6.0f} | "
                 f"flag {100 * np.mean(recent_flags):5.1f}%"
                 + (f" | frames {int(np.median(recent_frames))}" if args.speedrun and recent_frames else "")
-                + (f" | pipe {100 * np.mean(recent_pipe):.0f}%" if args.pipe_mode and recent_pipe else "")
+                + (f" | pipe {100 * np.mean(recent_pipe):.0f}% of finishes" if args.pipe_mode and recent_pipe else "")
                 + (f" | start {curriculum_start:.2f}" if args.curriculum else "")
                 + (f" | critic warmup, value loss {v_loss.item():.3f}" if warming_up else "")
             )
