@@ -5,6 +5,7 @@
     python watch_run.py --mp4 runs/speedrun/best_run.mp4          # save a video too
     python watch_run.py --mp4 runs/speedrun/best_run.mp4 --no-window   # just the video
     python watch_run.py --speed 0.5                  # slow motion
+    python watch_run.py --ckpt a.pt b.pt c.pt        # play all quietly, show the one that got closest
 
 Every NES frame is shown (not just one per agent step), with a frame counter, and a
 virtual NES controller underneath that lights up exactly the buttons the AI is holding
@@ -63,9 +64,36 @@ def draw_gamepad(width, s, held, fresh):
     return pad
 
 
+def load_model(path, device):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)  # our own file
+    model = ActorCritic(ckpt["obs_shape"][0], ckpt["n_actions"]).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    return model, ckpt["args"]
+
+
+@torch.no_grad()
+def closeness(path, device):
+    """Play a checkpoint greedily without recording. Higher is better: any finish beats any
+    non-finish, faster finishes beat slower ones, and otherwise further is better."""
+    model, train_args = load_model(path, device)
+    env = make_env(**play_env_kwargs(train_args))
+    obs, _ = env.reset()
+    info, done = {}, False
+    while not done:
+        action = model.act(torch.from_numpy(obs).unsqueeze(0).to(device), greedy=True)[0].item()
+        obs, _, term, trunc, info = env.step(action)
+        done = term or trunc
+    env.close()
+    if info.get("flag_get"):
+        return (1, -info["frames"])
+    return (0, info.get("x_pos", 0))
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", default=None)
+    p.add_argument("--ckpt", nargs="+", default=None,
+                   help="one checkpoint, or several: they're all played quietly and the closest one is shown")
     p.add_argument("--speed", type=float, default=1.0, help="1.0 = real time")
     p.add_argument("--scale", type=int, default=3, help="window/video size multiplier")
     p.add_argument("--mp4", default=None, help="also save the run to this video file")
@@ -74,17 +102,14 @@ def main():
     p.add_argument("--label", default="", help="text shown at the top of every frame")
     args = p.parse_args()
 
-    ckpt_path = args.ckpt or next(
-        (f for f in ("models/pipe/fastest.pt", "models/speedrun/fastest.pt", "models/ppo/solved.pt", "models/ppo/best.pt")
-         if os.path.exists(f)), None)
-    if ckpt_path is None:
-        raise SystemExit("No checkpoint found. Pass --ckpt.")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # our own file
-    train_args = ckpt["args"]
     device = pick_device(args.device)
-    model = ActorCritic(ckpt["obs_shape"][0], ckpt["n_actions"]).to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
+    candidates = args.ckpt or [next(
+        (f for f in ("models/pipe/fastest.pt", "models/speedrun/fastest.pt", "models/ppo/solved.pt", "models/ppo/best.pt")
+         if os.path.exists(f)), None)]
+    if candidates[0] is None:
+        raise SystemExit("No checkpoint found. Pass --ckpt.")
+    ckpt_path = candidates[0] if len(candidates) == 1 else max(candidates, key=lambda c: closeness(c, device))
+    model, train_args = load_model(ckpt_path, device)
 
     env = make_env(**play_env_kwargs(train_args))
 
@@ -119,6 +144,9 @@ def main():
     result = (f"cleared in {total} frames ({total / NES_FPS:.2f} s){route}" if cleared
               else f"did NOT clear, reached x={info.get('x_pos')}{route}")
     print(f"{ckpt_path}: {result}")
+    picked = torch.load(ckpt_path, map_location="cpu", weights_only=False).get("update")
+    if len(candidates) > 1 and picked is not None:
+        result += f" (update {picked})"
     top_label = f"{args.label}  |  {result}" if args.label else ""
 
     h, w, _ = frames[0].shape

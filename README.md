@@ -161,9 +161,10 @@ python train_ppo.py --pipe-mode --init-from models/ppo/solved.pt
 - Critic warmup (30 updates) runs automatically when starting from a checkpoint.
 - Training lines show `pipe N%` (the share of finished runs that used the pipe), and
   evaluations say `via the PIPE` when the record run takes it.
-- **Previews**: every 30 updates (`--preview-every`), the best run so far (`fastest.pt`, or
-  else `best.pt`) is replayed in the background and saved to `runs/<run>/previews/update_N.mp4`,
-  labelled with the update, the step, and whether it cleared and took the pipe. A window
+- **Previews**: every 5 updates (`--preview-every`), the networks from those last 5 updates are
+  replayed in the background and a video of the one that got closest to the flag (the fastest
+  finish, otherwise the furthest distance) is saved to `runs/<run>/previews/update_N.mp4`. It's
+  labelled with which update it came from and whether it cleared and took the pipe. A window
   (`preview_window.py`) loops the newest preview at real speed. Use `--no-preview-window` to
   only save the videos.
 - `--curriculum demos/pipe.json` is the "assisted" variant. It shows Mario that the
