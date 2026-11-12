@@ -12,7 +12,9 @@ virtual NES controller underneath that lights up exactly the buttons the AI is h
 on that frame (a white ring marks a fresh press). Press q in the window to quit.
 """
 import argparse
+import json
 import os
+import shutil
 import time
 import warnings
 
@@ -100,6 +102,9 @@ def main():
     p.add_argument("--no-window", action="store_true")
     p.add_argument("--device", default="cpu", help="cpu matches speedrun_eval.py exactly")
     p.add_argument("--label", default="", help="text shown at the top of every frame")
+    p.add_argument("--best-file", default=None,
+                   help="personal-best mode: only make a video if the run beats the score stored in this "
+                        "JSON file; the new best score and video are then saved next to it")
     args = p.parse_args()
 
     device = pick_device(args.device)
@@ -108,7 +113,19 @@ def main():
          if os.path.exists(f)), None)]
     if candidates[0] is None:
         raise SystemExit("No checkpoint found. Pass --ckpt.")
-    ckpt_path = candidates[0] if len(candidates) == 1 else max(candidates, key=lambda c: closeness(c, device))
+    if len(candidates) == 1 and not args.best_file:
+        ckpt_path = candidates[0]
+    else:
+        scores = {c: closeness(c, device) for c in candidates}
+        ckpt_path = max(candidates, key=scores.get)
+        if args.best_file:
+            previous = None
+            if os.path.exists(args.best_file):
+                with open(args.best_file) as f:
+                    previous = tuple(json.load(f)["score"])
+            if previous is not None and scores[ckpt_path] <= previous:
+                print(f"no new personal best ({scores[ckpt_path]} vs {previous}); no video")
+                return
     model, train_args = load_model(ckpt_path, device)
 
     env = make_env(**play_env_kwargs(train_args))
@@ -183,6 +200,11 @@ def main():
     if writer is not None:
         writer.release()
         os.replace(tmp_mp4, args.mp4)
+        if args.best_file:
+            # remember the new personal best (score + a copy of its video) next to the checkpoints
+            shutil.copy(args.mp4, os.path.splitext(args.best_file)[0] + ".mp4")
+            with open(args.best_file, "w") as f:
+                json.dump({"score": list(scores[ckpt_path]), "label": top_label}, f)
         print(f"saved {args.mp4}")
     if not args.no_window:
         cv2.waitKey(1500)

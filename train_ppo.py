@@ -48,6 +48,7 @@ Pipe mode (let Mario find the 1-1 pipe shortcut):
 """
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -285,8 +286,9 @@ def main():
     writer = SummaryWriter(run_dir)
 
     # Previews: every --preview-every updates, the networks from those last updates are replayed
-    # in a background process (training doesn't wait), and a video of the one that got closest
-    # to the flag is saved in <run_dir>/previews. A separate window loops the newest one.
+    # in a background process (training doesn't wait). The closest one gets a video in
+    # <run_dir>/previews only if it beats the run's personal best, so the window (which loops the
+    # newest video) only ever shows improvements.
     here = os.path.dirname(os.path.abspath(__file__))
     preview_dir = os.path.join(run_dir, "previews")
     preview_render = None
@@ -295,6 +297,12 @@ def main():
         os.makedirs(preview_dir, exist_ok=True)
         print(f"preview every {args.preview_every} updates: the closest run of the last "
               f"{recent_nets.maxlen} updates -> {preview_dir}")
+        # personal best so far (from earlier sessions of this run too): show it straight away
+        preview_best = os.path.join(args.save_dir, "preview_best.json")
+        best_video = os.path.join(args.save_dir, "preview_best.mp4")
+        if os.path.exists(best_video):
+            shutil.copy(best_video, os.path.join(preview_dir, f"update_{update:05d}.mp4"))
+        preview_log = open(os.path.join(preview_dir, "preview_errors.log"), "a")
         if not args.no_preview_window:
             subprocess.Popen([sys.executable, os.path.join(here, "preview_window.py"), preview_dir])
     rng = np.random.default_rng()
@@ -513,7 +521,9 @@ def main():
             recent_nets.append((update, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}))
         if args.preview_every and update % args.preview_every == 0 and \
                 (preview_render is None or preview_render.poll() is not None):
-            # write the recent networks out; the preview process plays each one and shows the closest
+            # write the recent networks out; the background preview plays each one and makes a video
+            # of the closest only if it's a new personal best (stored next to the checkpoints, so it
+            # survives --resume). Training never waits for any of this.
             candidates = []
             for k, (u, weights) in enumerate(recent_nets):
                 path = os.path.join(preview_dir, f"_candidate{k}.pt")
@@ -521,11 +531,12 @@ def main():
                             "args": vars(args), "update": u}, path)
                 candidates.append(path)
             first = recent_nets[0][0]
-            label = f"closest of updates {first}-{update}, step {global_step:,}"
+            label = f"best of updates {first}-{update}, step {global_step:,}"
             preview_render = subprocess.Popen(
                 [sys.executable, os.path.join(here, "watch_run.py"), "--ckpt", *candidates, "--no-window",
-                 "--scale", "2", "--label", label, "--mp4", os.path.join(preview_dir, f"update_{update:05d}.mp4")],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                 "--scale", "2", "--label", label, "--best-file", preview_best,
+                 "--mp4", os.path.join(preview_dir, f"update_{update:05d}.mp4")],
+                stdout=subprocess.DEVNULL, stderr=preview_log)
 
         if streak >= args.solve_streak and not args.speedrun:
             torch.save({"model": model.state_dict(), "n_actions": n_actions,
