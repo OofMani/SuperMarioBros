@@ -140,6 +140,10 @@ def parse_args():
                          # ~1,950 frames and a fresh network finds it within ~10 updates, so the speed
                          # bonus has to pay for every frame below that, not only below 1,400
                          "--ref-frames": ("ref_frames", 3000),
+                         # dying is a small nudge, not the main signal: at -500 it swamped the progress
+                         # reward near the start, so running into the first Goomba looked no better
+                         # than standing still until the stuck timer
+                         "--death-penalty": ("death_penalty", 50.0),
                          "--reward-scale": ("reward_scale", 0.01),
                          "--curriculum": ("curriculum", "demos/overland.json"),
                          "--savestate-prob": ("savestate_prob", 0.0), "--gamma": ("gamma", 0.997),

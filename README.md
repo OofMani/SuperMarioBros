@@ -153,9 +153,13 @@ python train_ppo.py --pipe-mode --init-from models/ppo/solved.pt
   action-layer surgery: its rows are copied, and the new buttons start at bias -2, so it
   plays exactly like `solved.pt` at first.
 - **Game-accurate timing**, so no animation skips.
-- **Reward**: a finish bonus of 1,000, plus 5 per frame under 3,000, -500 for dying or getting
+- **Reward**: a finish bonus of 1,000, plus 5 per frame under 3,000, -50 for dying or getting
   stuck (after 50 steps without progress), -0.05 per frame, plus 20% of the old x reward as a
   nudge. The pipe still pays clearly overall.
+  - **The death penalty started at -500.** That swamped the progress reward near the start:
+    dying at the first Goomba and standing still until the timer scored about the same, so
+    full runs got worse and the greedy Mario stood still. At -50, dying is a nudge again,
+    like the -15 that worked in the original overland training.
   - **First attempt:** with a 150-step stuck timer and no per-frame cost, the greedy Mario
     learned to **stand still**. Waiting put off the -500, and the discount made a later penalty
     look smaller. The short timer and the per-frame cost removed that incentive.
