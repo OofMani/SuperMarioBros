@@ -4,3 +4,4 @@ models/ppo/
 models/dqn/
 games/
 .DS_Store
+models/speedrun/

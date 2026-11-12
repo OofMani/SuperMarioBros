@@ -24,6 +24,7 @@ def _worker(remote, env_kwargs):
                     "x_pos": int(info.get("x_pos", 0)),
                     "flag_get": bool(info.get("flag_get", False)),
                     "from_save": bool(info.get("from_save", False)),
+                    "frames": int(info.get("frames", 0)),
                 }
                 if done:
                     obs, _ = env.reset()

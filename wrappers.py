@@ -47,10 +47,14 @@ class MarioWrapper(gym.Wrapper):
                      if Mario is standing on the ground with A still held from before,
                      A is let go for one frame first. Otherwise a policy that keeps
                      choosing right+A gets stuck pushing against a tall pipe forever.
+    - time_cost:     speedrun reward: subtract this much per NES frame (0 = off)
+    - speed_bonus:   speedrun reward: at the flag, add this much per frame finished
+                     under ref_frames (0 = off)
     """
 
     def __init__(self, env, skip=4, stack=4, size=84, stuck_steps=150, flag_bonus=50.0,
-                 savestate_prob=0.0, savestate_spacing=200, buttons=None):
+                 savestate_prob=0.0, savestate_spacing=200, buttons=None,
+                 time_cost=0.0, speed_bonus=0.0, ref_frames=1400):
         super().__init__(env)
         # For each action that holds A: the same action without A (None if it has no A)
         self.release_a = {}
@@ -65,9 +69,12 @@ class MarioWrapper(gym.Wrapper):
         self.size = size
         self.stuck_steps = stuck_steps
         self.flag_bonus = flag_bonus
+        self.time_cost = time_cost
+        self.speed_bonus = speed_bonus
+        self.ref_frames = ref_frames
         self.savestate_prob = savestate_prob if HAS_SNAPSHOTS else 0.0
         self.savestate_spacing = savestate_spacing
-        self.saves = {}  # bucket (x // spacing) -> snapshot handle
+        self.saves = {}  # bucket (x // spacing) -> (snapshot handle, frames elapsed when saved)
         self.from_save = False
         self.frames = deque(maxlen=stack)
         self.raw = None  # last full-colour frame, used for the tiled view
@@ -77,6 +84,21 @@ class MarioWrapper(gym.Wrapper):
         while not hasattr(nes, "_x_position"):
             nes = nes.env
         self.nes = nes
+
+        # Speedrun timing: count every NES frame since the level started.
+        # step() runs one frame; the env also runs extra frames itself through
+        # _frame_advance while skipping animations (pipes, area changes), so
+        # those are counted separately. A run with skipped_frames > 0 went
+        # through a skipped animation and its time won't match the real game.
+        self.frame_count = 0
+        self.skipped_frames = 0
+        original_advance = nes._frame_advance
+
+        def counted_advance(action):
+            self.skipped_frames += 1
+            original_advance(action)
+
+        nes._frame_advance = counted_advance
 
     def _process(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -94,18 +116,26 @@ class MarioWrapper(gym.Wrapper):
         on_ground = ram[0x001D] == 0   # not jumping or falling
         normal = ram[0x000E] == 0x08   # normal player state (not dying, not in a pipe)
         bucket = info.get("x_pos", 0) // self.savestate_spacing
-        if bucket == 0 or not (on_ground and normal) or bucket in self.saves:
+        if bucket == 0 or not (on_ground and normal) or self.from_save:
             return
-        self.saves[bucket] = _LIB.Snapshot(nes._env)
+        frames = self.frame_count + self.skipped_frames
+        old = self.saves.get(bucket)
+        if old is not None:
+            if frames >= old[1]:
+                return  # keep the save from the faster arrival
+            _LIB.FreeSnapshot(old[0])
+        self.saves[bucket] = (_LIB.Snapshot(nes._env), frames)
 
     def _load_random_save(self):
+        """Load a random save. Returns the screen and the frame count it was saved at."""
         nes = self.nes
-        _LIB.LoadSnapshot(nes._env, self.saves[random.choice(list(self.saves))])
+        handle, frames = self.saves[random.choice(list(self.saves))]
+        _LIB.LoadSnapshot(nes._env, handle)
         nes._did_reset()  # resync the reward bookkeeping (x, time, score) to the loaded state
-        return nes.screen.copy()
+        return nes.screen.copy(), frames
 
     def close(self):
-        for handle in self.saves.values():
+        for handle, _ in self.saves.values():
             _LIB.FreeSnapshot(handle)
         self.saves.clear()
         super().close()
@@ -114,8 +144,11 @@ class MarioWrapper(gym.Wrapper):
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.from_save = bool(self.saves) and random.random() < self.savestate_prob
+        self.frame_count = 0
+        self.skipped_frames = 0
         if self.from_save:
-            obs = self._load_random_save()
+            # carry over the frames it took to get there, so speed rewards stay honest
+            obs, self.frame_count = self._load_random_save()
         self.raw = obs
         self.best_x = int(self.nes._x_position)
         self.no_progress = 0
@@ -131,11 +164,13 @@ class MarioWrapper(gym.Wrapper):
         action = int(action)
         presses_a = action in self.release_a
         on_ground = self.nes.ram[0x001D] == 0
+        frames_before = self.frame_count + self.skipped_frames
         for i in range(self.skip):
             frame_action = action
             if i == 0 and presses_a and self.a_held and on_ground:
                 frame_action = self.release_a[action]  # let go of A so the next frame is a fresh press
             obs, reward, terminated, truncated, info = self.env.step(frame_action)
+            self.frame_count += 1
             total_reward += reward
             if terminated or truncated:
                 break
@@ -143,8 +178,10 @@ class MarioWrapper(gym.Wrapper):
         self.raw = obs
         self.frames.append(self._process(obs))
 
+        frames_now = self.frame_count + self.skipped_frames
+        total_reward -= self.time_cost * (frames_now - frames_before)
         if info.get("flag_get", False):
-            total_reward += self.flag_bonus
+            total_reward += self.flag_bonus + self.speed_bonus * max(0, self.ref_frames - frames_now)
             terminated = True
 
         x = info.get("x_pos", 0)
@@ -158,6 +195,8 @@ class MarioWrapper(gym.Wrapper):
 
         self._maybe_save(info, terminated or truncated)
         info["from_save"] = self.from_save
+        info["frames"] = frames_now  # from a save: includes the frames it took to reach the save
+        info["skipped_frames"] = self.skipped_frames
         return self._obs(), total_reward, terminated, truncated, info
 
 

@@ -15,9 +15,21 @@ Speed tricks:
 
 Training stops on its own once the greedy policy clears the level on every
 evaluation run (with random start delays) several evaluations in a row.
+
+Speedrun mode (fine-tune a solved Mario to finish faster):
+
+    python train_ppo.py --speedrun --init-from models/ppo/solved.pt
+
+  - adds a small cost per NES frame and a flag bonus that grows the faster he
+    finishes (--time-cost, --speed-bonus, --ref-frames)
+  - uses gamma 0.997 so the finish-time bonus reaches back to early decisions,
+    and the gentle fine-tuning settings lr 5e-5 / ent-coef 0.005
+  - one evaluation run always starts on frame 0 (a real speedrun start); every
+    new record is saved as fastest.pt. It never stops on its own.
 """
 import argparse
 import os
+import sys
 import time
 import warnings
 from collections import deque
@@ -62,22 +74,47 @@ def parse_args():
     p.add_argument("--resume", action="store_true")
     p.add_argument("--save-dir", default="models/ppo")
     p.add_argument("--device", default="auto")
-    return p.parse_args()
+    p.add_argument("--skip", type=int, default=4, help="NES frames per agent step")
+    # speedrun mode
+    p.add_argument("--speedrun", action="store_true", help="optimise finish time (see top of file)")
+    p.add_argument("--init-from", default=None, help="start from these weights (fresh optimizer and step count)")
+    p.add_argument("--time-cost", type=float, default=None, help="reward lost per NES frame (speedrun: 0.25)")
+    p.add_argument("--speed-bonus", type=float, default=None,
+                   help="flag bonus per frame finished under --ref-frames (speedrun: 1.0)")
+    p.add_argument("--ref-frames", type=int, default=1400)
+    args = p.parse_args()
+    if args.speedrun:
+        # defaults for speedrun mode, used only for flags not given on the command line
+        given = {a.split("=")[0] for a in sys.argv[1:] if a.startswith("--")}
+        speedrun_defaults = {"--time-cost": ("time_cost", 0.25), "--speed-bonus": ("speed_bonus", 1.0),
+                             "--gamma": ("gamma", 0.997), "--lr": ("lr", 5e-5),
+                             "--ent-coef": ("ent_coef", 0.005), "--save-dir": ("save_dir", "models/speedrun")}
+        for flag, (name, value) in speedrun_defaults.items():
+            if flag not in given:
+                setattr(args, name, value)
+    args.time_cost = args.time_cost or 0.0
+    args.speed_bonus = args.speed_bonus or 0.0
+    return args
 
 
 @torch.no_grad()
-def evaluate(model, device, eval_envs, rng, max_steps=3000):
+def evaluate(model, device, eval_envs, rng, max_steps=3000, frame0=False):
     """Play greedily (always the best-scoring action, no randomness), all runs at once.
 
     The emulator is deterministic, so each run first waits a random 0-30
     steps; a policy that only memorised one exact path fails this.
+    With frame0=True, run 0 starts with no wait (the speedrun start).
+    Returns (win rate, mean x, frames of run 0 or None if it didn't finish).
     """
     n = eval_envs.num_envs
     obs = eval_envs.reset()
     noops = rng.integers(0, 31, size=n)
+    if frame0:
+        noops[0] = 0
     finished = np.zeros(n, dtype=bool)
     wins = np.zeros(n, dtype=bool)
     xs = np.zeros(n)
+    frames0 = None
     for t in range(max_steps):
         action, _, _ = model.act(torch.from_numpy(obs).to(device), greedy=True)
         action = action.cpu().numpy()
@@ -87,9 +124,11 @@ def evaluate(model, device, eval_envs, rng, max_steps=3000):
             finished[i] = True
             wins[i] = infos[i]["flag_get"]
             xs[i] = infos[i]["x_pos"]
+            if i == 0 and wins[i]:
+                frames0 = infos[i]["frames"]
         if finished.all():
             break
-    return wins.mean(), xs.mean()
+    return float(wins.mean()), float(xs.mean()), frames0
 
 
 def main():
@@ -101,8 +140,13 @@ def main():
     if args.savestate_prob > 0 and not HAS_SNAPSHOTS:
         print("Save-state starts need the patched emulator (bash tools/build_nes_py.sh); running without them.")
     print(f"device={device}  envs={args.num_envs}  level={args.level}  savestate_prob={args.savestate_prob}")
+    if args.speedrun:
+        print(f"speedrun mode: time_cost={args.time_cost}/frame  speed_bonus={args.speed_bonus}/frame "
+              f"under {args.ref_frames}  gamma={args.gamma}  lr={args.lr}  ent_coef={args.ent_coef}  "
+              f"skip={args.skip}  save_dir={args.save_dir}")
 
-    env_kwargs = dict(level=args.level, actions=args.actions)
+    env_kwargs = dict(level=args.level, actions=args.actions, skip=args.skip,
+                      time_cost=args.time_cost, speed_bonus=args.speed_bonus, ref_frames=args.ref_frames)
     N, T = args.num_envs, args.num_steps
     half = N // 2
     groups = [SubprocVecEnv(half, dict(env_kwargs, savestate_prob=args.savestate_prob)) for _ in range(2)]
@@ -117,16 +161,23 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
     global_step, update, streak, best_eval = 0, 0, 0, -1.0
+    best_frames = None  # fastest frame-0 finish so far (speedrun mode)
     latest = os.path.join(args.save_dir, "latest.pt")
+    if args.init_from and not (args.resume and os.path.exists(latest)):
+        init = torch.load(args.init_from, map_location=device, weights_only=False)  # our own file
+        model.load_state_dict(init["model"])
+        print(f"starting from the weights in {args.init_from}")
     if args.resume and os.path.exists(latest):
         ckpt = torch.load(latest, map_location=device, weights_only=False)  # our own file
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         global_step, update = ckpt["global_step"], ckpt["update"]
         streak, best_eval = ckpt.get("streak", 0), ckpt.get("best_eval", -1.0)
+        best_frames = ckpt.get("best_frames")
         print(f"resumed from step {global_step}")
 
-    writer = SummaryWriter(f"runs/ppo_{args.level}_{time.strftime('%Y%m%d-%H%M%S')}")
+    run_kind = "speedrun" if args.speedrun else "ppo"
+    writer = SummaryWriter(f"runs/{run_kind}_{args.level}_{time.strftime('%Y%m%d-%H%M%S')}")
     rng = np.random.default_rng()
 
     batch = N * T
@@ -145,6 +196,7 @@ def main():
     next_done = [torch.zeros(half, device=device) for _ in groups]
     ep_return = np.zeros(N)
     recent_returns, recent_x, recent_flags = deque(maxlen=100), deque(maxlen=100), deque(maxlen=100)
+    recent_frames = deque(maxlen=100)  # frames to the flag, full runs that finished
     watching = args.watch
     frames_cache, infos_cache = [None, None], [[{"x_pos": 0}] * half, [{"x_pos": 0}] * half]
     t_start, steps_at_start = time.time(), global_step
@@ -165,6 +217,8 @@ def main():
                 recent_returns.append(ep_return[j])
                 recent_x.append(infos[i]["x_pos"])
                 recent_flags.append(float(infos[i]["flag_get"]))
+                if infos[i]["flag_get"]:
+                    recent_frames.append(infos[i]["frames"])
                 writer.add_scalar("episode/return", ep_return[j], global_step)
                 writer.add_scalar("episode/x_pos", infos[i]["x_pos"], global_step)
             ep_return[j] = 0
@@ -258,15 +312,27 @@ def main():
                 f"update {update:5d} | step {global_step:9d} | {sps:5.0f} sps | "
                 f"return {np.mean(recent_returns):7.1f} | x {np.mean(recent_x):6.0f} | "
                 f"flag {100 * np.mean(recent_flags):5.1f}%"
+                + (f" | frames {int(np.median(recent_frames))}" if args.speedrun and recent_frames else "")
             )
+            if recent_frames:
+                writer.add_scalar("train/frames_to_flag_median", float(np.median(recent_frames)), global_step)
 
         # ---- Greedy evaluation: is it actually beating the level? ----
         if update % args.eval_every == 0:
             model.eval()
-            win_rate, mean_x = map(float, evaluate(model, device, eval_envs, rng))
+            win_rate, mean_x, frames0 = evaluate(model, device, eval_envs, rng, frame0=args.speedrun)
             writer.add_scalar("eval/win_rate", win_rate, global_step)
             writer.add_scalar("eval/x_pos", mean_x, global_step)
-            print(f"  eval: cleared {100 * win_rate:.0f}% of {args.eval_episodes} runs, mean x {mean_x:.0f}")
+            print(f"  eval: cleared {100 * win_rate:.0f}% of {args.eval_episodes} runs, mean x {mean_x:.0f}"
+                  + (f" | frame-0 run: {frames0 if frames0 else 'did not finish'} frames" if args.speedrun else ""))
+            if args.speedrun and frames0:
+                writer.add_scalar("eval/frames_to_flag", frames0, global_step)
+                if best_frames is None or frames0 < best_frames:
+                    best_frames = frames0
+                    torch.save({"model": model.state_dict(), "n_actions": n_actions, "obs_shape": obs_shape,
+                                "args": vars(args), "frames": frames0},
+                               os.path.join(args.save_dir, "fastest.pt"))
+                    print(f"  new record: {frames0} frames ({frames0 / 60.0988:.2f} s), saved fastest.pt")
             score = float(win_rate * 10_000 + mean_x)
             if score > best_eval:
                 best_eval = score
@@ -278,12 +344,12 @@ def main():
         torch.save(
             {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
              "global_step": global_step, "update": update, "streak": streak,
-             "best_eval": best_eval, "args": vars(args),
+             "best_eval": best_eval, "best_frames": best_frames, "args": vars(args),
              "n_actions": n_actions, "obs_shape": obs_shape},
             latest,
         )
 
-        if streak >= args.solve_streak:
+        if streak >= args.solve_streak and not args.speedrun:
             torch.save({"model": model.state_dict(), "n_actions": n_actions,
                         "obs_shape": obs_shape, "args": vars(args)},
                        os.path.join(args.save_dir, "solved.pt"))

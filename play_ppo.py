@@ -33,7 +33,8 @@ def main():
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    env = make_env(level=train_args["level"], actions=train_args["actions"], render_mode="human")
+    env = make_env(level=train_args["level"], actions=train_args["actions"], render_mode="human",
+                   skip=train_args.get("skip", 4))
     print(f"Playing {ckpt_path}")
     for ep in range(args.episodes):
         obs, _ = env.reset()
