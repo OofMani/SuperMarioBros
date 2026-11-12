@@ -1,8 +1,22 @@
 # Super Mario Bros Reinforcement Learning
 
-This is based of a DQN Model designed to play Super Mario Bros.
+An AI that learns to play Super Mario Bros (NES) World 1-1 from the screen pixels.
 
-This was inspired by a YouTube video [here](https://youtu.be/_gmQZToTMac).
+It started years ago as a DQN agent, inspired by a YouTube video
+[here](https://youtu.be/_gmQZToTMac), that never finished the level. It was rebuilt
+with PPO and parallel training, and it now clears 1-1 every time and speedruns it
+in **1,208 frames (20.10 s)**.
+
+## Results so far
+
+| Milestone | Result |
+|---|---|
+| Original DQN (≈2022) | Never finished 1-1 |
+| PPO, first clear with no randomness | ~1.39M training steps |
+| PPO, first 5/5 perfect evaluation | ~1.66M steps (update 810) |
+| `solved.pt` (3 perfect evaluations in a row) | Clears 1-1 from 20/20 random start delays |
+| Solved run, timed | 1,240 frames = 20.63 s (in-game timer 339 at the flag) |
+| **Speedrun fine-tune, best** | **1,208 frames = 20.10 s** |
 
 ## Setup
 
@@ -10,34 +24,106 @@ This was inspired by a YouTube video [here](https://youtu.be/_gmQZToTMac).
 conda create -n mario-ppo python=3.11
 conda activate mario-ppo
 pip install -r requirements.txt
-bash tools/build_nes_py.sh     # optional but recommended: ~45% faster emulator + save states
+bash tools/build_nes_py.sh     # recommended: ~46% faster emulator + multiple save states
 ```
 
-## PPO with parallel Marios (recommended)
+## Scripts
 
-```bash
-python train_ppo.py            # 16 Marios in parallel, no window (fastest)
-python train_ppo.py --watch    # same, but shows them all tiled in one window (press q to hide)
-python train_ppo.py --resume   # continue from models/ppo/latest.pt
-python play_ppo.py             # watch the trained agent play
-tensorboard --logdir runs      # training graphs
-```
+| Script | What it does |
+|---|---|
+| `train_ppo.py` | PPO training with 16 parallel Marios (`--watch` to see them tiled, `--resume` to continue) |
+| `train_ppo.py --speedrun --init-from <ckpt>` | Fine-tune a solved Mario to finish faster (see below) |
+| `play_ppo.py` | Watch a checkpoint play (`solved.pt` → `best.pt` → `latest.pt`) |
+| `speedrun_eval.py` | Time a checkpoint exactly from frame 0 (`--delays 20` checks robustness, `--save` writes JSON) |
+| `watch_run.py` | Play a run at true 60 fps with a frame counter (`--mp4` saves a video, `--speed 0.25` slow motion) |
+| `main.py` | The original DQN approach, fixed up |
+| `tensorboard --logdir runs` | Training charts (`eval/win_rate`, `eval/x_pos`, `eval/frames_to_flag`, `train/flag_rate_100`, ...) |
 
-Speed tricks: the Marios run in two groups that take turns, so the network picks
-actions for one group while the other group's games are running. About 30% of training
-episodes start from save states further into the level (`--savestate-prob`), so Mario
-practises the hard parts instead of replaying the start every time.
+## How it works
 
-Training stops by itself once the agent clears the level with no randomness on
-every evaluation run, 3 evaluations in a row, and saves `models/ppo/solved.pt`.
+- **PPO with an actor-critic CNN** (`ppo_model.py`). The input is the last 4 frames, grayscale, 84×84.
+  The actor picks a button combo and the critic estimates how good the situation is.
+- **16 Marios in parallel** (`vec_env.py`), split into two groups that take turns, so the network
+  picks actions for one group while the other group's games run.
+- **Mario wrapper** (`wrappers.py`):
+  - frame skip 4, frame stack, and stuck detection
+  - a flag bonus
+  - **auto-release of A** (see the lessons below)
+  - frame counting for speedruns
+  - optional speed rewards
+- **Save-state starts**: 30% of training episodes start mid-level from saved states, so Mario
+  practises the hard parts. This needs the patched emulator, which can hold many save states.
+- **Evaluation** always plays the network's top action, with no randomness, from random start
+  delays. The emulator is deterministic, so a policy that memorised one exact path fails this test.
 
-## DQN (the original approach, fixed up)
+## Progress log
 
-```bash
-python main.py                 # add --display to watch
-```
+### 1. Reviving the old DQN
+The original agent had several problems that stopped it from ever finishing:
+- `gamma=0.9`: it only planned about 40 frames ahead.
+- `eps_min=0.1`: 10% of moves stayed random forever, even when testing.
+- It rendered every frame while training.
+- A float32 replay buffer that would have needed about 22 GB.
+- No Apple GPU support.
+- No detection of a stuck Mario.
 
-Changes from the original: gamma 0.99 instead of 0.9, epsilon goes from 1.0 down to 0.05
-and evaluation uses no randomness, Double DQN with Huber loss, a uint8 replay buffer
-(about 6x less memory), training on the Apple GPU (MPS), and episodes that end early
-when Mario is stuck.
+All of these were fixed in `agent.py` and `main.py`. The main effort then moved to PPO.
+
+### 2. PPO and speed
+- The first PPO version with 8 parallel Marios ran at about 300 steps/s.
+- The emulator turned out to be the bottleneck, at only 784 NES frames/s per core.
+  Rebuilding nes-py with Apple Silicon optimisations raised that to **1,146 frames/s (+46%)**.
+- A small C++ patch added multiple save states, which made the mid-level starts possible.
+- Splitting 16 Marios into two groups that take turns, plus running the evaluation games in
+  parallel, brought training to about **600–700 steps/s**. That's close to the Mac's practical
+  limit; 6,000 steps/s would need roughly 40 or more CPU cores.
+
+### 3. Getting it to clear 1-1
+| Problem | Symptom | Fix |
+|---|---|---|
+| Greedy test Mario undecided between "run" and "jump" | The test always died at the first pipe (x=434) for ~400k steps | Lowered the entropy bonus from 0.01 to 0.005 |
+| **A-held trap**: the NES only jumps when A is *pressed*, and Mario can't see whether A is held | The test pushed against the tall pipe (x≈722) until the timer ran out | Wrapper releases A for 1 frame when Mario is on the ground |
+| Evaluations swinging (100% → 0%) after solving | The learning rate was still high | Resumed with `--lr 5e-5`, and the solve criterion was met |
+
+The A-held fix was the turning point. Within about 20k steps the test distance jumped from 722 to
+2,082, Mario made his first clear, and the training flag rate went from 0% to 12% and then on to 98%.
+
+### 4. Speedrun (branch `speedrun-1-1`)
+- **Measurement.** The wrapper counts every NES frame from the level start to grabbing the flagpole.
+  The in-game timer ticks every 20 frames in this emulator. Runs that went through the
+  emulator's skipped animations are flagged, because their times wouldn't match the real game.
+- **Baseline.** `solved.pt` finishes in **1,240 frames**. It held up for every random start
+  delay (best 1,239 frames, worst 1,303).
+- **Speedrun fine-tune** (`--speedrun`): a per-frame time cost, a flag bonus that grows the faster
+  he finishes, gamma 0.997 and lr 5e-5, starting from `solved.pt`. Result: **1,208 frames (20.10 s)**.
+- **Pushing further didn't work**:
+  - Speed bonus 50, reward scale 0.01 and lr 1e-4: **collapsed** (flag rate 98% → 2%).
+  - Speed bonus 5: slid from 100% to 52%.
+  - Cause: changing the reward made the critic's value estimates wrong (value loss about 40),
+    so PPO judged every move against wrong expectations and wrecked the actor.
+  - **Fix**: `--critic-warmup N` trains only the critic's last layer for N updates while the
+    actor stays frozen. It stopped the collapse, with the flag rate staying at 88–97%.
+    But the speed still didn't improve past 1,208, and the training median drifted from about
+    1,250 to about 1,270 frames. **The overland route has plateaued for this setup.**
+
+### Lessons
+1. **What the agent can observe and how its actions work matter as much as the algorithm.**
+   The A-held trap cost about a million training steps. No amount of hyperparameter tuning
+   fixes an action whose result depends on something the agent can't see.
+2. **The entropy bonus pays the agent for being undecided.** That's good early on, but it can
+   keep the greedy "always pick the top move" policy stuck exactly where decisions are close.
+3. **Changing the reward on a trained agent requires recalibrating the critic first**,
+   or PPO will damage the policy.
+4. **RL plateaus a few frames short of optimal.** 4-frame steps can't express frame-perfect
+   timing, which is where search (TAS-style) or a different route comes in.
+
+## Next: the overhaul branch
+Speedrunners reach about 370 on the in-game timer in 1-1 by taking the enterable pipe to the
+underground bonus room. Our overland run finishes at 339. The next branch will try to let the AI
+find that route:
+- **all buttons**, including Down, added by "surgery" on the solved model's action layer
+  (the existing 5 actions are copied, and the new ones start with a strongly negative score)
+- a **route-neutral reward** with a massive finish and speed bonus, because the current
+  "pixels moved right" reward punishes the pipe shortcut
+- **game-accurate pipe timing**, by turning off the emulator's animation skipping
+- a **reverse curriculum** from save states, because a finish-only reward is too sparse to learn from scratch

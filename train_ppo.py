@@ -22,6 +22,8 @@ Speedrun mode (fine-tune a solved Mario to finish faster):
 
   - adds a small cost per NES frame and a flag bonus that grows the faster he
     finishes (--time-cost, --speed-bonus, --ref-frames)
+  - after changing reward settings on a trained model, add --critic-warmup 30
+    so the critic relearns what situations are worth before the actor moves
   - uses gamma 0.997 so the finish-time bonus reaches back to early decisions,
     and the gentle fine-tuning settings lr 5e-5 / ent-coef 0.005
   - one evaluation run always starts on frame 0 (a real speedrun start); every
@@ -82,6 +84,10 @@ def parse_args():
     p.add_argument("--speed-bonus", type=float, default=None,
                    help="flag bonus per frame finished under --ref-frames (speedrun: 1.0)")
     p.add_argument("--ref-frames", type=int, default=1400)
+    p.add_argument("--critic-warmup", type=int, default=0,
+                   help="first N updates of this run train only the critic's output layer (actor frozen). "
+                        "Use after changing the reward on a trained model.")
+    p.add_argument("--warmup-lr", type=float, default=1e-3)
     args = p.parse_args()
     if args.speedrun:
         # defaults for speedrun mode, used only for flags not given on the command line
@@ -159,6 +165,10 @@ def main():
 
     model = ActorCritic(obs_shape[0], n_actions).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
+    # Critic warmup: only the critic's last layer learns, so Mario's play (actor) and the
+    # shared vision layers stay exactly as they were while the value estimates catch up
+    critic_opt = torch.optim.Adam(model.critic.parameters(), lr=args.warmup_lr, eps=1e-5)
+    warmup_left = args.critic_warmup
 
     global_step, update, streak, best_eval = 0, 0, 0, -1.0
     best_frames = None  # fastest frame-0 finish so far (speedrun mode)
@@ -273,6 +283,11 @@ def main():
             returns = adv + val_buf
 
         # ---- 3. Learn: several passes over the batch with the clipped PPO loss ----
+        warming_up = warmup_left > 0
+        if warming_up:
+            warmup_left -= 1
+            if warmup_left == 0:
+                print("  critic warmup finished: the actor learns from the next update")
         model.train()
         b_obs = obs_buf.reshape(batch, *obs_shape)
         b_act, b_logp = act_buf.reshape(-1), logp_buf.reshape(-1)
@@ -293,6 +308,13 @@ def main():
                 ).mean()
                 v_loss = 0.5 * (value - b_ret[idx]).pow(2).mean()
                 entropy = dist.entropy().mean()
+                if warming_up:
+                    critic_opt.zero_grad()
+                    v_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.critic.parameters(), args.max_grad_norm)
+                    critic_opt.step()
+                    continue
+
                 loss = pg_loss + args.vf_coef * v_loss - args.ent_coef * entropy
 
                 optimizer.zero_grad()
@@ -313,6 +335,7 @@ def main():
                 f"return {np.mean(recent_returns):7.1f} | x {np.mean(recent_x):6.0f} | "
                 f"flag {100 * np.mean(recent_flags):5.1f}%"
                 + (f" | frames {int(np.median(recent_frames))}" if args.speedrun and recent_frames else "")
+                + (f" | critic warmup, value loss {v_loss.item():.3f}" if warming_up else "")
             )
             if recent_frames:
                 writer.add_scalar("train/frames_to_flag_median", float(np.median(recent_frames)), global_step)

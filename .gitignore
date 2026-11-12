@@ -1,7 +1,7 @@
 __pycache__/
 runs/
-models/ppo/
-models/dqn/
 games/
 .DS_Store
-models/speedrun/
+# trained checkpoints (large); only the original DQN model is kept in git
+models/*
+!models/first_run/
