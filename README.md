@@ -38,7 +38,7 @@ bash tools/build_nes_py.sh     # recommended: ~46% faster emulator + multiple sa
 | `speedrun_eval.py` | Time a checkpoint exactly from frame 0 (`--delays 20` checks robustness, `--save` writes JSON) |
 | `preview_window.py <run>/previews` | Loop the newest training preview at real speed (opened automatically by training) |
 | `make_demo.py overland\|pipe` | Record a frame-exact demo for the reverse curriculum |
-| `watch_run.py` | Play a run at true 60 fps with a frame counter (`--mp4` saves a video, `--speed 0.25` slow motion) |
+| `watch_run.py` | Play a run at true 60 fps with a frame counter and a virtual NES controller showing the buttons held on every frame (`--mp4` saves a video, `--speed 0.25` slow motion) |
 | `main.py` | The original DQN approach, fixed up |
 | `tensorboard --logdir runs` | Training charts (`eval/win_rate`, `eval/x_pos`, `eval/frames_to_flag`, `train/flag_rate_100`, ...) |
 

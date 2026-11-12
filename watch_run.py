@@ -6,8 +6,9 @@
     python watch_run.py --mp4 runs/speedrun/best_run.mp4 --no-window   # just the video
     python watch_run.py --speed 0.5                  # slow motion
 
-Every NES frame is shown (not just one per agent step), with a frame counter.
-Press q in the window to quit.
+Every NES frame is shown (not just one per agent step), with a frame counter, and a
+virtual NES controller underneath that lights up exactly the buttons the AI is holding
+on that frame (a white ring marks a fresh press). Press q in the window to quit.
 """
 import argparse
 import os
@@ -21,9 +22,45 @@ import numpy as np
 import torch
 
 from ppo_model import ActorCritic, pick_device
-from wrappers import make_env, play_env_kwargs
+from wrappers import ACTION_SETS, make_env, play_env_kwargs
 
 NES_FPS = 60.0988
+
+# BGR colours
+PAD_BG, BODY, DARK, DIM = (30, 30, 30), (200, 200, 200), (70, 70, 70), (120, 120, 120)
+LIT_DPAD, LIT_AB, AB_OFF, RING = (0, 215, 255), (40, 40, 235), (95, 95, 110), (255, 255, 255)
+
+
+def draw_gamepad(width, s, held, fresh):
+    """An NES controller, `width` pixels wide and scaled by s. held/fresh are sets of button names."""
+    h = 40 * s
+    pad = np.full((h, width, 3), PAD_BG, dtype=np.uint8)
+    cx, cy, arm, t = 34 * s, h // 2, 11 * s, 4 * s
+    cv2.rectangle(pad, (6 * s, 4 * s), (width - 6 * s, h - 4 * s), BODY, -1)
+    # D-pad: one rectangle per direction, lit when held
+    arms = {"up": ((cx - t, cy - arm), (cx + t, cy - t)), "down": ((cx - t, cy + t), (cx + t, cy + arm)),
+            "left": ((cx - arm, cy - t), (cx - t, cy + t)), "right": ((cx + t, cy - t), (cx + arm, cy + t))}
+    cv2.rectangle(pad, (cx - t, cy - t), (cx + t, cy + t), DARK, -1)
+    for name, (p1, p2) in arms.items():
+        cv2.rectangle(pad, p1, p2, LIT_DPAD if name in held else DARK, -1)
+        if name in fresh:
+            cv2.rectangle(pad, p1, p2, RING, max(1, s // 2))
+    # Select / Start (the AI never uses them, drawn dimmed)
+    for i, name in enumerate(("SELECT", "START")):
+        x = width // 2 - 22 * s + i * 26 * s
+        cv2.rectangle(pad, (x, cy - 2 * s), (x + 16 * s, cy + 2 * s), DIM, -1)
+        cv2.putText(pad, name, (x - s, cy + 9 * s), cv2.FONT_HERSHEY_SIMPLEX, 0.12 * s, DIM, 1)
+    # B and A
+    for name, x, role in (("B", width - 58 * s, "run"), ("A", width - 30 * s, "jump")):
+        cv2.circle(pad, (x, cy - 2 * s), 9 * s, LIT_AB if name in held else AB_OFF, -1)
+        if name in fresh:
+            cv2.circle(pad, (x, cy - 2 * s), 9 * s, RING, max(1, s // 2))
+        cv2.putText(pad, name, (x - 3 * s, cy + 1 * s), cv2.FONT_HERSHEY_SIMPLEX, 0.25 * s, (255, 255, 255), max(1, s // 2))
+        cv2.putText(pad, role, (x - 6 * s, cy + 15 * s), cv2.FONT_HERSHEY_SIMPLEX, 0.13 * s, DARK, 1)
+    # what's held, in words
+    words = "+".join(b for b in ("left", "right", "up", "down", "B", "A") if b in held) or "nothing"
+    cv2.putText(pad, words, (cx + 16 * s, h - 7 * s), cv2.FONT_HERSHEY_SIMPLEX, 0.15 * s, DARK, 1)
+    return pad
 
 
 def main():
@@ -51,19 +88,23 @@ def main():
 
     env = make_env(**play_env_kwargs(train_args))
 
-    # Grab every NES frame: hook the layer the wrapper steps once per frame
-    frames = []
+    # Grab every NES frame and the buttons held on it: hook the layer the wrapper steps once per
+    # frame (it receives the per-frame action, after auto-release has let go of A if needed)
+    frames, held = [], []
     inner_step = env.env.step
+    buttons = ACTION_SETS[train_args["actions"]]
 
     def recording_step(action):
         result = inner_step(action)
         frames.append(env.nes.screen.copy())
+        held.append(set(buttons[action]) - {"NOOP"})
         return result
 
     env.env.step = recording_step
 
     obs, _ = env.reset()
     frames.append(env.nes.screen.copy())
+    held.append(set())
     info, done = {}, False
     with torch.no_grad():
         while not done:
@@ -82,11 +123,13 @@ def main():
 
     h, w, _ = frames[0].shape
     size = (w * args.scale, h * args.scale)
+    pad_h = 40 * args.scale
+    out_size = (size[0], size[1] + pad_h)  # game on top, controller underneath
     writer = None
     if args.mp4:
         os.makedirs(os.path.dirname(args.mp4) or ".", exist_ok=True)
         tmp_mp4 = args.mp4[:-4] + ".partial.mp4"  # renamed when done, so watchers never see half a file
-        writer = cv2.VideoWriter(tmp_mp4, cv2.VideoWriter_fourcc(*"mp4v"), NES_FPS, size)
+        writer = cv2.VideoWriter(tmp_mp4, cv2.VideoWriter_fourcc(*"mp4v"), NES_FPS, out_size)
 
     frame_time = 1.0 / (NES_FPS * args.speed)
     start = time.perf_counter()
@@ -99,6 +142,8 @@ def main():
             cv2.rectangle(img, (0, 0), (size[0], 14 * args.scale), (0, 0, 0), -1)
             cv2.putText(img, top_label, (8, 10 * args.scale), cv2.FONT_HERSHEY_SIMPLEX, 0.15 * args.scale,
                         (255, 255, 255), 1)
+        fresh = held[i] - (held[i - 1] if i else set())
+        img = np.vstack([img, draw_gamepad(size[0], args.scale, held[i], fresh)])
         if writer is not None:
             writer.write(img)
         if not args.no_window:
