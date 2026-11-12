@@ -204,8 +204,10 @@ def main():
         writer.release()
         os.replace(tmp_mp4, args.mp4)
         if args.best_file:
-            # remember the new personal best (score + a copy of its video) next to the checkpoints
+            # remember the new personal best (score, its video, and the network itself) next to the
+            # checkpoints; the candidate files get overwritten, so this is the only copy of that network
             shutil.copy(args.mp4, os.path.splitext(args.best_file)[0] + ".mp4")
+            shutil.copy(ckpt_path, os.path.splitext(args.best_file)[0] + ".pt")
             tmp_json = args.best_file + ".tmp"
             with open(tmp_json, "w") as f:
                 json.dump({"score": [int(v) for v in scores[ckpt_path]], "label": top_label}, f)
