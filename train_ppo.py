@@ -47,6 +47,8 @@ Pipe mode (let Mario find the 1-1 pipe shortcut):
 """
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 import time
 import warnings
@@ -89,6 +91,10 @@ def parse_args():
     p.add_argument("--solve-streak", type=int, default=3, help="perfect evals in a row to stop")
     p.add_argument("--watch", action="store_true", help="show all Marios tiled in a window")
     p.add_argument("--render-every", type=int, default=2, help="steps between window refreshes")
+    p.add_argument("--preview-every", type=int, default=30,
+                   help="every N updates, render the best run so far to a video (0 = off)")
+    p.add_argument("--no-preview-window", action="store_true",
+                   help="still save preview videos, but don't open the window that plays them")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--save-dir", default="models/ppo")
     p.add_argument("--device", default="auto")
@@ -261,7 +267,20 @@ def main():
         print(f"resumed from step {global_step}")
 
     run_kind = "pipe" if args.pipe_mode else ("speedrun" if args.speedrun else "ppo")
-    writer = SummaryWriter(f"runs/{run_kind}_{args.level}_{time.strftime('%Y%m%d-%H%M%S')}")
+    run_dir = f"runs/{run_kind}_{args.level}_{time.strftime('%Y%m%d-%H%M%S')}"
+    writer = SummaryWriter(run_dir)
+
+    # Previews: every --preview-every updates the best checkpoint so far is replayed and saved
+    # as a video in <run_dir>/previews, in a background process so training doesn't wait.
+    # A separate window loops the newest one.
+    here = os.path.dirname(os.path.abspath(__file__))
+    preview_dir = os.path.join(run_dir, "previews")
+    preview_render = None
+    if args.preview_every:
+        os.makedirs(preview_dir, exist_ok=True)
+        print(f"previews of the best run every {args.preview_every} updates -> {preview_dir}")
+        if not args.no_preview_window:
+            subprocess.Popen([sys.executable, os.path.join(here, "preview_window.py"), preview_dir])
     rng = np.random.default_rng()
 
     batch = N * T
@@ -472,6 +491,19 @@ def main():
              "n_actions": n_actions, "obs_shape": obs_shape},
             latest,
         )
+
+        if args.preview_every and update % args.preview_every == 0 and \
+                (preview_render is None or preview_render.poll() is not None):
+            # "best run": the fastest finish if there is one, else the furthest-reaching evaluation
+            source = next((os.path.join(args.save_dir, f) for f in ("fastest.pt", "best.pt", "latest.pt")
+                           if os.path.exists(os.path.join(args.save_dir, f))))
+            snapshot = os.path.join(preview_dir, "_checkpoint.pt")
+            shutil.copy(source, snapshot)  # copy first, so the trainer can keep overwriting the original
+            label = f"update {update}, step {global_step:,}, {os.path.basename(source)}"
+            preview_render = subprocess.Popen(
+                [sys.executable, os.path.join(here, "watch_run.py"), "--ckpt", snapshot, "--no-window",
+                 "--scale", "2", "--label", label, "--mp4", os.path.join(preview_dir, f"update_{update:05d}.mp4")],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         if streak >= args.solve_streak and not args.speedrun:
             torch.save({"model": model.state_dict(), "n_actions": n_actions,

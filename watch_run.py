@@ -34,6 +34,7 @@ def main():
     p.add_argument("--mp4", default=None, help="also save the run to this video file")
     p.add_argument("--no-window", action="store_true")
     p.add_argument("--device", default="cpu", help="cpu matches speedrun_eval.py exactly")
+    p.add_argument("--label", default="", help="text shown at the top of every frame")
     args = p.parse_args()
 
     ckpt_path = args.ckpt or next(
@@ -73,15 +74,19 @@ def main():
 
     cleared = info.get("flag_get", False)
     total = info.get("frames", len(frames) - 1)
-    print(f"{ckpt_path}: {'cleared' if cleared else 'did NOT clear'} in {total} frames "
-          f"({total / NES_FPS:.2f} s)" + ("" if cleared else f", reached x={info.get('x_pos')}"))
+    route = " via the PIPE" if info.get("pipe") else ""
+    result = (f"cleared in {total} frames ({total / NES_FPS:.2f} s){route}" if cleared
+              else f"did NOT clear, reached x={info.get('x_pos')}{route}")
+    print(f"{ckpt_path}: {result}")
+    top_label = f"{args.label}  |  {result}" if args.label else ""
 
     h, w, _ = frames[0].shape
     size = (w * args.scale, h * args.scale)
     writer = None
     if args.mp4:
         os.makedirs(os.path.dirname(args.mp4) or ".", exist_ok=True)
-        writer = cv2.VideoWriter(args.mp4, cv2.VideoWriter_fourcc(*"mp4v"), NES_FPS, size)
+        tmp_mp4 = args.mp4[:-4] + ".partial.mp4"  # renamed when done, so watchers never see half a file
+        writer = cv2.VideoWriter(tmp_mp4, cv2.VideoWriter_fourcc(*"mp4v"), NES_FPS, size)
 
     frame_time = 1.0 / (NES_FPS * args.speed)
     start = time.perf_counter()
@@ -90,6 +95,10 @@ def main():
         label = f"frame {i}  {i / NES_FPS:5.2f}s"
         cv2.putText(img, label, (10, size[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6 * args.scale / 2,
                     (255, 255, 255), max(1, args.scale // 2))
+        if top_label:
+            cv2.rectangle(img, (0, 0), (size[0], 14 * args.scale), (0, 0, 0), -1)
+            cv2.putText(img, top_label, (8, 10 * args.scale), cv2.FONT_HERSHEY_SIMPLEX, 0.15 * args.scale,
+                        (255, 255, 255), 1)
         if writer is not None:
             writer.write(img)
         if not args.no_window:
@@ -100,6 +109,7 @@ def main():
                 break
     if writer is not None:
         writer.release()
+        os.replace(tmp_mp4, args.mp4)
         print(f"saved {args.mp4}")
     if not args.no_window:
         cv2.waitKey(1500)

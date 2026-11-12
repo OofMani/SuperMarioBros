@@ -48,7 +48,6 @@ def expand_actions(state_dict, old_buttons, new_buttons, new_bias=-3.0):
     new action list. New combos get small random weights and a negative bias, so at
     first they're rarely picked (Mario plays as before) but exploration can still find them.
     """
-    import math
     old_sets = [frozenset(b) for b in old_buttons]
     new_sets = [frozenset(b) for b in new_buttons]
     w_old, b_old = state_dict["actor.weight"], state_dict["actor.bias"]

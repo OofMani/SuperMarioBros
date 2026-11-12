@@ -36,6 +36,8 @@ bash tools/build_nes_py.sh     # recommended: ~46% faster emulator + multiple sa
 | `train_ppo.py --speedrun --init-from <ckpt>` | Fine-tune a solved Mario to finish faster (see below) |
 | `play_ppo.py` | Watch a checkpoint play (`solved.pt` → `best.pt` → `latest.pt`) |
 | `speedrun_eval.py` | Time a checkpoint exactly from frame 0 (`--delays 20` checks robustness, `--save` writes JSON) |
+| `preview_window.py <run>/previews` | Loop the newest training preview at real speed (opened automatically by training) |
+| `make_demo.py overland\|pipe` | Record a frame-exact demo for the reverse curriculum |
 | `watch_run.py` | Play a run at true 60 fps with a frame counter (`--mp4` saves a video, `--speed 0.25` slow motion) |
 | `main.py` | The original DQN approach, fixed up |
 | `tensorboard --logdir runs` | Training charts (`eval/win_rate`, `eval/x_pos`, `eval/frames_to_flag`, `train/flag_rate_100`, ...) |
@@ -159,6 +161,11 @@ python train_ppo.py --pipe-mode --init-from models/ppo/solved.pt
 - Critic warmup (30 updates) runs automatically when starting from a checkpoint.
 - Training lines show `pipe N%` (the share of finished runs that used the pipe), and
   evaluations say `via the PIPE` when the record run takes it.
+- **Previews**: every 30 updates (`--preview-every`), the best run so far (`fastest.pt`, or
+  else `best.pt`) is replayed in the background and saved to `runs/<run>/previews/update_N.mp4`,
+  labelled with the update, the step, and whether it cleared and took the pipe. A window
+  (`preview_window.py`) loops the newest preview at real speed. Use `--no-preview-window` to
+  only save the videos.
 - `--curriculum demos/pipe.json` is the "assisted" variant. It shows Mario that the
   route exists without telling him to take it.
 
