@@ -87,9 +87,10 @@ def closeness(path, device):
         obs, _, term, trunc, info = env.step(action)
         done = term or trunc
     env.close()
+    # plain ints: the emulator reports numpy integers, which JSON can't store
     if info.get("flag_get"):
-        return (1, -info["frames"])
-    return (0, info.get("x_pos", 0))
+        return (1, -int(info["frames"]))
+    return (0, int(info.get("x_pos", 0)))
 
 
 def main():
@@ -120,9 +121,11 @@ def main():
         ckpt_path = max(candidates, key=scores.get)
         if args.best_file:
             previous = None
-            if os.path.exists(args.best_file):
+            try:
                 with open(args.best_file) as f:
                     previous = tuple(json.load(f)["score"])
+            except (FileNotFoundError, ValueError, KeyError):
+                previous = None  # no best yet, or a damaged file: treat as no best
             if previous is not None and scores[ckpt_path] <= previous:
                 print(f"no new personal best ({scores[ckpt_path]} vs {previous}); no video")
                 return
@@ -203,8 +206,10 @@ def main():
         if args.best_file:
             # remember the new personal best (score + a copy of its video) next to the checkpoints
             shutil.copy(args.mp4, os.path.splitext(args.best_file)[0] + ".mp4")
-            with open(args.best_file, "w") as f:
-                json.dump({"score": list(scores[ckpt_path]), "label": top_label}, f)
+            tmp_json = args.best_file + ".tmp"
+            with open(tmp_json, "w") as f:
+                json.dump({"score": [int(v) for v in scores[ckpt_path]], "label": top_label}, f)
+            os.replace(tmp_json, args.best_file)  # all at once, so it's never left half-written
         print(f"saved {args.mp4}")
     if not args.no_window:
         cv2.waitKey(1500)
